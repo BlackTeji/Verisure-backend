@@ -1,0 +1,15 @@
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = [
+  "npx prisma generate",
+  "npx tsc --project tsconfig.json",
+  "npx prisma migrate deploy"
+]
+
+[start]
+cmd = "node dist/server.js"
