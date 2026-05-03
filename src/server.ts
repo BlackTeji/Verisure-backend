@@ -91,6 +91,32 @@ await app.register(holderRoutes, { prefix: '/api/v1/holders' })
 await app.register(verifierRoutes, { prefix: '/api/v1/verifiers' })
 await app.register(adminRoutes, { prefix: '/api/v1/admin' })
 
+
+// ── ONE-TIME SEED ─────────────────────────────────────────────
+// Remove this route after first successful seed
+app.post('/api/seed', async (req, reply) => {
+    const { token, password } = req.body as { token: string; password: string }
+    if (token !== env.ADMIN_INITIAL_PASSWORD) {
+        return reply.status(403).send({ error: 'Forbidden' })
+    }
+    const { scrypt, randomBytes } = await import('crypto')
+    const { promisify } = await import('util')
+    const scryptAsync = promisify(scrypt)
+    const email = env.ADMIN_EMAIL ?? 'admin@verisure.ng'
+    const existing = await db.user.findUnique({ where: { email } })
+    if (existing) {
+        return reply.status(200).send({ message: 'Admin already exists', email })
+    }
+    const salt = randomBytes(32).toString('hex')
+    const key = await scryptAsync(password, salt, 64) as Buffer
+    const passwordHash = salt + ':' + key.toString('hex')
+    const user = await db.user.create({
+        data: { email, passwordHash, role: 'ADMIN', firstName: 'VeriSure', lastName: 'Admin', emailVerified: true, isActive: true },
+        select: { id: true, email: true }
+    })
+    return reply.status(201).send({ message: 'Admin created', email: user.email, id: user.id })
+})
+
 // ── ERROR HANDLERS ────────────────────────────────────────────
 app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not found' }))
 
