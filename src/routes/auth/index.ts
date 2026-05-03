@@ -1,0 +1,249 @@
+import type { FastifyInstance } from 'fastify'
+import { z } from 'zod'
+import { scrypt, randomBytes } from 'crypto'
+import { promisify } from 'util'
+import { db } from '../../lib/db.js'
+import { logger } from '../../lib/logger.js'
+import { issueAccessToken, issueRefreshToken, verifyRefreshToken, blacklistAccessToken, revokeAllUserTokens } from '../../lib/jwt.js'
+import { sha256, generateSecureToken } from '../../lib/crypto.js'
+import { emailQueue } from '../../lib/queue.js'
+import { authenticate } from '../../hooks/authenticate.js'
+import { audit } from '../../hooks/audit.js'
+import { env } from '../../config/env.js'
+
+const scryptAsync = promisify(scrypt)
+const COOKIE = 'vrs_refresh'
+
+// ── PASSWORD ──────────────────────────────────────────────────
+async function hashPassword(p: string): Promise<string> {
+    const salt = randomBytes(32).toString('hex')
+    const key = await scryptAsync(p, salt, 64) as Buffer
+    return `${salt}:${key.toString('hex')}`
+}
+
+async function verifyPassword(p: string, stored: string): Promise<boolean> {
+    const [salt, hash] = stored.split(':')
+    if (!salt || !hash) return false
+    const key = await scryptAsync(p, salt, 64) as Buffer
+    const ref = Buffer.from(hash, 'hex')
+    if (key.length !== ref.length) return false
+    let diff = 0
+    for (let i = 0; i < key.length; i++) diff |= (key[i] ?? 0) ^ (ref[i] ?? 0)
+    return diff === 0
+}
+
+// ── COOKIE HELPERS ────────────────────────────────────────────
+function setRefreshCookie(reply: any, token: string, expiresAt: Date): void {
+    reply.setCookie(COOKIE, token, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: 'strict', path: '/api/v1/auth/refresh', expires: expiresAt })
+}
+
+function clearRefreshCookie(reply: any): void {
+    reply.clearCookie(COOKIE, { path: '/api/v1/auth/refresh' })
+}
+
+// ── SCHEMAS ───────────────────────────────────────────────────
+const signupSchema = z.object({
+    email: z.string().email().toLowerCase(),
+    password: z.string().min(8).max(128),
+    role: z.enum(['HOLDER', 'ISSUER', 'VERIFIER']),
+    firstName: z.string().max(100).optional(),
+    lastName: z.string().max(100).optional(),
+    phone: z.string().optional(),
+    institutionName: z.string().optional(),
+    institutionType: z.string().optional(),
+    registrationNumber: z.string().optional(),
+    contactFirstName: z.string().optional(),
+    contactLastName: z.string().optional(),
+    contactTitle: z.string().optional(),
+    officialEmail: z.string().email().optional(),
+    annualVolume: z.string().optional(),
+    organisationName: z.string().optional(),
+    organisationType: z.string().optional(),
+    teamSize: z.string().optional(),
+    monthlyVolume: z.string().optional(),
+})
+
+export default async function authRoutes(app: FastifyInstance) {
+
+    // POST /signup
+    app.post('/signup', async (req, reply) => {
+        const body = signupSchema.safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+        const d = body.data
+
+        const existing = await db.user.findUnique({ where: { email: d.email } })
+        if (existing) return reply.status(409).send({ error: 'Conflict', message: 'Account already exists' })
+
+        if (d.role === 'ISSUER' && (!d.institutionName || !d.officialEmail || !d.contactFirstName || !d.contactLastName)) {
+            return reply.status(400).send({ error: 'Validation error', message: 'Institution details required' })
+        }
+
+        const passwordHash = await hashPassword(d.password)
+
+        const user = await db.$transaction(async tx => {
+            const u = await tx.user.create({
+                data: { email: d.email, passwordHash, role: d.role, firstName: d.firstName ?? null, lastName: d.lastName ?? null, phone: d.phone ?? null },
+                select: { id: true, email: true, role: true },
+            })
+
+            if (d.role === 'HOLDER') await tx.holderProfile.create({ data: { userId: u.id } })
+            if (d.role === 'ISSUER') await tx.issuerProfile.create({ data: { userId: u.id, institutionName: d.institutionName!, institutionType: d.institutionType ?? '', registrationNumber: d.registrationNumber ?? null, officialEmail: d.officialEmail!, phone: d.phone ?? null, contactFirstName: d.contactFirstName!, contactLastName: d.contactLastName!, contactTitle: d.contactTitle ?? null, annualVolume: d.annualVolume ?? null, status: 'PENDING' } })
+            if (d.role === 'VERIFIER') await tx.verifierProfile.create({ data: { userId: u.id, organisationName: d.organisationName ?? '', organisationType: d.organisationType ?? '', teamSize: d.teamSize ?? null, monthlyVolume: d.monthlyVolume ?? null } })
+
+            return u
+        })
+
+        const token = generateSecureToken()
+        const tokenHash = sha256(token)
+        await db.emailVerificationToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86400000) } })
+
+        await emailQueue.add('email_verification', { type: 'email_verification', to: user.email, name: d.firstName ?? d.institutionName ?? 'there', data: { verifyUrl: `${env.FRONTEND_URL}/verify-email?token=${token}` } })
+
+        audit({ action: 'USER_SIGNUP', req, targetType: 'user', targetId: user.id, metadata: { role: user.role } })
+
+        const message = d.role === 'ISSUER'
+            ? 'Application received. You will be notified when reviewed.'
+            : 'Account created. Check your email to verify.'
+
+        return reply.status(201).send({ message, userId: user.id, role: user.role })
+    })
+
+    // POST /login
+    app.post('/login', async (req, reply) => {
+        const body = z.object({ email: z.string().email().toLowerCase(), password: z.string() }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const user = await db.user.findUnique({ where: { email: body.data.email } })
+        const isValid = user ? await verifyPassword(body.data.password, user.passwordHash) : (await hashPassword('dummy') && false)
+
+        if (!user || !isValid) {
+            if (user) await db.user.update({ where: { id: user.id }, data: { failedLoginCount: { increment: 1 }, lockedUntil: user.failedLoginCount >= 9 ? new Date(Date.now() + 900000) : undefined } })
+            return reply.status(401).send({ error: 'Unauthorized', message: 'Incorrect email or password' })
+        }
+
+        if (user.isSuspended) return reply.status(403).send({ error: 'Forbidden', message: 'Account suspended. Contact support.' })
+        if (user.lockedUntil && user.lockedUntil > new Date()) {
+            return reply.status(429).send({ error: 'Locked', message: `Account locked. Try in ${Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60000)} minutes.` })
+        }
+
+        await db.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastLoginIp: req.ip } })
+
+        const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
+            issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
+            issueRefreshToken({ userId: user.id, ip: req.ip, agent: req.headers['user-agent'] }),
+        ])
+
+        setRefreshCookie(reply, refreshToken, expiresAt)
+        audit({ action: 'USER_LOGIN', req, targetType: 'user', targetId: user.id })
+
+        return reply.status(200).send({ accessToken, user: { id: user.id, email: user.email, role: user.role } })
+    })
+
+    // POST /refresh
+    app.post('/refresh', async (req, reply) => {
+        const token = (req.cookies as Record<string, string>)[COOKIE]
+            ?? (z.object({ refreshToken: z.string() }).safeParse(req.body).success ? (req.body as any).refreshToken : null)
+
+        if (!token) return reply.status(401).send({ error: 'Unauthorized', message: 'Refresh token required' })
+
+        try {
+            const payload = await verifyRefreshToken(token)
+            const user = await db.user.findUnique({ where: { id: payload.sub as string }, select: { id: true, email: true, role: true, isSuspended: true } })
+
+            if (!user || user.isSuspended) { clearRefreshCookie(reply); return reply.status(401).send({ error: 'Unauthorized' }) }
+
+            const [accessToken, { token: newRefresh, expiresAt }] = await Promise.all([
+                issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
+                issueRefreshToken({ userId: user.id, family: payload.family, ip: req.ip, agent: req.headers['user-agent'] }),
+            ])
+
+            setRefreshCookie(reply, newRefresh, expiresAt)
+            audit({ action: 'TOKEN_REFRESHED', req, targetType: 'user', targetId: user.id })
+
+            return reply.status(200).send({ accessToken })
+        } catch {
+            clearRefreshCookie(reply)
+            return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid refresh token' })
+        }
+    })
+
+    // POST /logout
+    app.post('/logout', { preHandler: authenticate }, async (req, reply) => {
+        const token = req.headers.authorization?.slice(7)
+
+        if (token) {
+            try {
+                const { jwtVerify } = await import('jose')
+                const secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
+                const { payload } = await jwtVerify(token, secret)
+                if (payload.jti && payload.exp) await blacklistAccessToken(payload.jti, payload.exp)
+            } catch { /* already expired */ }
+        }
+
+        clearRefreshCookie(reply)
+
+        if (req.userId) {
+            await db.refreshToken.updateMany({ where: { userId: req.userId, isRevoked: false }, data: { isRevoked: true, revokedAt: new Date() } })
+            audit({ action: 'USER_LOGOUT', req, targetType: 'user', targetId: req.userId })
+        }
+
+        return reply.status(200).send({ message: 'Logged out' })
+    })
+
+    // GET /verify-email
+    app.get('/verify-email', async (req, reply) => {
+        const token = (req.query as Record<string, string>)['token']
+        if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
+
+        const record = await db.emailVerificationToken.findUnique({ where: { tokenHash: sha256(token) } })
+        if (!record || record.usedAt || record.expiresAt < new Date()) {
+            return reply.status(400).send({ error: 'Bad request', message: 'Invalid or expired link' })
+        }
+
+        await db.$transaction([
+            db.emailVerificationToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
+            db.user.update({ where: { id: record.userId }, data: { emailVerified: true, emailVerifiedAt: new Date() } }),
+        ])
+
+        return reply.status(200).send({ message: 'Email verified' })
+    })
+
+    // POST /forgot-password
+    app.post('/forgot-password', async (req, reply) => {
+        const body = z.object({ email: z.string().email().toLowerCase() }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error' })
+
+        const user = await db.user.findUnique({ where: { email: body.data.email } })
+        if (user) {
+            const token = generateSecureToken()
+            const tokenHash = sha256(token)
+            await db.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 3600000) } })
+            await emailQueue.add('password_reset', { type: 'password_reset', to: user.email, name: user.firstName ?? 'there', data: { resetUrl: `${env.FRONTEND_URL}/reset-password?token=${token}` } })
+        }
+
+        return reply.status(200).send({ message: 'If an account exists, a reset link has been sent.' })
+    })
+
+    // POST /reset-password
+    app.post('/reset-password', async (req, reply) => {
+        const body = z.object({ token: z.string(), password: z.string().min(8).max(128) }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error' })
+
+        const record = await db.passwordResetToken.findUnique({ where: { tokenHash: sha256(body.data.token) } })
+        if (!record || record.usedAt || record.expiresAt < new Date()) {
+            return reply.status(400).send({ error: 'Bad request', message: 'Invalid or expired link' })
+        }
+
+        const passwordHash = await hashPassword(body.data.password)
+
+        await db.$transaction([
+            db.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
+            db.user.update({ where: { id: record.userId }, data: { passwordHash, failedLoginCount: 0, lockedUntil: null } }),
+        ])
+
+        await revokeAllUserTokens(record.userId)
+        audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: record.userId })
+
+        return reply.status(200).send({ message: 'Password reset. Please log in.' })
+    })
+}

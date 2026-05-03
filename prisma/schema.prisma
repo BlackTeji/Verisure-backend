@@ -1,0 +1,534 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  HOLDER
+  ISSUER
+  VERIFIER
+  ADMIN
+}
+
+enum IssuerStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+  FROZEN
+}
+
+enum CredentialStatus {
+  ACTIVE
+  REVOKED
+  FROZEN
+  EXPIRED
+}
+
+enum VerificationMethod {
+  DASHBOARD
+  QR_SCAN
+  API
+  BULK_CSV
+  SELF_VERIFY
+}
+
+enum AuditAction {
+  USER_SIGNUP
+  USER_LOGIN
+  USER_LOGOUT
+  USER_PASSWORD_CHANGED
+  USER_EMAIL_VERIFIED
+  USER_SUSPENDED
+  TOKEN_REFRESHED
+  TOKEN_REVOKED
+  CREDENTIAL_ISSUED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_FROZEN
+  CREDENTIAL_UNFROZEN
+  CREDENTIAL_EXPIRED
+  CREDENTIAL_VERIFIED
+  BULK_VERIFICATION_STARTED
+  BULK_VERIFICATION_COMPLETED
+  ISSUER_APPLIED
+  ISSUER_APPROVED
+  ISSUER_SUSPENDED
+  ISSUER_FROZEN
+  ISSUER_UNSUSPENDED
+  API_KEY_CREATED
+  API_KEY_ROTATED
+  API_KEY_REVOKED
+  SHARE_GRANT_CREATED
+  SHARE_GRANT_REVOKED
+  ADMIN_ACTION
+  WHITELIST_PORTAL_CREATED
+  FRAUD_ALERT_RAISED
+  FRAUD_ALERT_RESOLVED
+  IP_BLOCKED
+  BULK_IMPORT_STARTED
+  BULK_IMPORT_COMPLETED
+  ANCHOR_CONFIRMED
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AlertStatus {
+  ACTIVE
+  RESOLVED
+  DISMISSED
+}
+
+model User {
+  id               String    @id @default(uuid())
+  email            String    @unique
+  emailVerified    Boolean   @default(false)
+  emailVerifiedAt  DateTime?
+  passwordHash     String
+  role             Role
+  firstName        String?
+  lastName         String?
+  phone            String?
+  isActive         Boolean   @default(true)
+  isSuspended      Boolean   @default(false)
+  suspendedAt      DateTime?
+  suspendedReason  String?
+  twoFactorEnabled Boolean   @default(false)
+  twoFactorSecret  String?
+  lastLoginAt      DateTime?
+  lastLoginIp      String?
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  refreshTokens   RefreshToken[]
+  emailTokens     EmailVerificationToken[]
+  passwordResets  PasswordResetToken[]
+  issuerProfile   IssuerProfile?
+  holderProfile   HolderProfile?
+  verifierProfile VerifierProfile?
+  auditLogs       AuditLog[]    @relation("AuditActor")
+  sessions        UserSession[]
+
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  family    String
+  isRevoked Boolean   @default(false)
+  revokedAt DateTime?
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  ipAddress String?
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([family])
+  @@map("refresh_tokens")
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("email_verification_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("password_reset_tokens")
+}
+
+model UserSession {
+  id         String    @id @default(uuid())
+  userId     String
+  ipAddress  String
+  userAgent  String
+  country    String?
+  city       String?
+  isActive   Boolean   @default(true)
+  lastSeenAt DateTime  @default(now())
+  createdAt  DateTime  @default(now())
+  revokedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+model IssuerProfile {
+  id                 String       @id @default(uuid())
+  userId             String       @unique
+  institutionName    String
+  institutionType    String
+  registrationNumber String?
+  domain             String?
+  officialEmail      String
+  phone              String?
+  contactFirstName   String
+  contactLastName    String
+  contactTitle       String?
+  annualVolume       String?
+  status             IssuerStatus @default(PENDING)
+  approvedAt         DateTime?
+  approvedById       String?
+  suspendedAt        DateTime?
+  suspendedReason    String?
+  frozenAt           DateTime?
+  frozenReason       String?
+  logoUrl            String?
+  websiteUrl         String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentials      Credential[]
+  teamMembers      IssuerTeamMember[]
+  whitelabelPortal WhitelabelPortal?
+  bulkJobs         BulkJob[]
+
+  @@index([status])
+  @@index([institutionName])
+  @@map("issuer_profiles")
+}
+
+model IssuerTeamMember {
+  id              String    @id @default(uuid())
+  issuerId        String
+  email           String
+  role            String
+  invitedAt       DateTime  @default(now())
+  acceptedAt      DateTime?
+  inviteTokenHash String?   @unique
+  inviteExpiresAt DateTime?
+
+  issuer IssuerProfile @relation(fields: [issuerId], references: [id], onDelete: Cascade)
+
+  @@unique([issuerId, email])
+  @@map("issuer_team_members")
+}
+
+model HolderProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shareGrants ShareGrant[]
+
+  @@map("holder_profiles")
+}
+
+model VerifierProfile {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  organisationName String
+  organisationType String
+  teamSize         String?
+  monthlyVolume    String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKeys       ApiKey[]
+  verifications VerificationLog[]
+  bulkJobs      BulkJob[]
+  webhooks      Webhook[]
+
+  @@index([organisationName])
+  @@map("verifier_profiles")
+}
+
+model Credential {
+  id                String           @id
+  issuerId          String
+  holderUserId      String?
+  holderName        String
+  holderEmail       String
+  credentialType    String
+  field             String?
+  notes             String?
+  status            CredentialStatus @default(ACTIVE)
+  issueDate         DateTime
+  expiryDate        DateTime?
+  sha256Hash        String           @unique
+  blockchainNetwork String?
+  txHash            String?
+  blockNumber       BigInt?
+  anchoredAt        DateTime?
+  anchorJobId       String?
+  revokedAt         DateTime?
+  revokedById       String?
+  revocationReason  String?
+  revocationCode    String?
+  frozenAt          DateTime?
+  frozenById        String?
+  frozenReason      String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  issuer        IssuerProfile     @relation(fields: [issuerId], references: [id])
+  verifications VerificationLog[]
+  shareGrants   ShareGrant[]
+
+  @@index([issuerId])
+  @@index([holderEmail])
+  @@index([holderUserId])
+  @@index([status])
+  @@index([sha256Hash])
+  @@map("credentials")
+}
+
+model VerificationLog {
+  id             String             @id @default(uuid())
+  credentialId   String
+  verifierId     String?
+  apiKeyId       String?
+  method         VerificationMethod
+  result         CredentialStatus
+  hashValid      Boolean
+  issuerApproved Boolean
+  ipAddress      String
+  userAgent      String?
+  country        String?
+  verifiedAt     DateTime           @default(now())
+
+  credential Credential      @relation(fields: [credentialId], references: [id])
+  verifier   VerifierProfile? @relation(fields: [verifierId], references: [id])
+  apiKey     ApiKey?          @relation(fields: [apiKeyId], references: [id])
+
+  @@index([credentialId])
+  @@index([verifierId])
+  @@index([verifiedAt])
+  @@map("verification_logs")
+}
+
+model ShareGrant {
+  id             String    @id @default(uuid())
+  credentialId   String
+  holderId       String
+  recipientEmail String
+  tokenHash      String    @unique
+  expiresAt      DateTime?
+  lastAccessedAt DateTime?
+  accessCount    Int       @default(0)
+  isRevoked      Boolean   @default(false)
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  credential Credential    @relation(fields: [credentialId], references: [id])
+  holder     HolderProfile @relation(fields: [holderId], references: [id])
+
+  @@index([tokenHash])
+  @@index([holderId])
+  @@map("share_grants")
+}
+
+model ApiKey {
+  id          String    @id @default(uuid())
+  verifierId  String
+  name        String
+  keyHash     String    @unique
+  keyPrefix   String
+  environment String
+  scopes      String[]
+  isActive    Boolean   @default(true)
+  lastUsedAt  DateTime?
+  lastUsedIp  String?
+  callCount   Int       @default(0)
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  verifier      VerifierProfile   @relation(fields: [verifierId], references: [id], onDelete: Cascade)
+  verifications VerificationLog[]
+
+  @@index([keyHash])
+  @@index([verifierId])
+  @@map("api_keys")
+}
+
+model Webhook {
+  id              String    @id @default(uuid())
+  verifierId      String
+  name            String
+  url             String
+  secretHash      String
+  events          String[]
+  isActive        Boolean   @default(true)
+  lastDeliveredAt DateTime?
+  failureCount    Int       @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  verifier   VerifierProfile   @relation(fields: [verifierId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([verifierId])
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id           String   @id @default(uuid())
+  webhookId    String
+  event        String
+  payload      Json
+  statusCode   Int?
+  responseBody String?
+  duration     Int?
+  attempt      Int      @default(1)
+  success      Boolean
+  createdAt    DateTime @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@index([createdAt])
+  @@map("webhook_deliveries")
+}
+
+model BulkJob {
+  id            String    @id @default(uuid())
+  type          String
+  issuerId      String?
+  verifierId    String?
+  filename      String
+  totalRows     Int
+  processedRows Int       @default(0)
+  succeededRows Int       @default(0)
+  failedRows    Int       @default(0)
+  status        JobStatus @default(PENDING)
+  resultFileUrl String?
+  errorLog      Json?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  issuer   IssuerProfile?   @relation(fields: [issuerId], references: [id])
+  verifier VerifierProfile? @relation(fields: [verifierId], references: [id])
+
+  @@index([issuerId])
+  @@index([verifierId])
+  @@index([status])
+  @@map("bulk_jobs")
+}
+
+model AuditLog {
+  id         String      @id @default(uuid())
+  action     AuditAction
+  actorId    String?
+  actorEmail String?
+  actorRole  String?
+  actorIp    String
+  actorAgent String?
+  targetType String?
+  targetId   String?
+  targetMeta Json?
+  metadata   Json?
+  createdAt  DateTime    @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([actorId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model WhitelabelPortal {
+  id             String    @id @default(uuid())
+  issuerId       String    @unique
+  customDomain   String?   @unique
+  displayName    String
+  tagline        String?
+  primaryColor   String    @default("#0047AB")
+  logoUrl        String?
+  dnsVerified    Boolean   @default(false)
+  dnsVerifiedAt  DateTime?
+  sslProvisioned Boolean   @default(false)
+  isLive         Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  issuer IssuerProfile @relation(fields: [issuerId], references: [id], onDelete: Cascade)
+
+  @@map("whitelabel_portals")
+}
+
+model FraudAlert {
+  id           String        @id @default(uuid())
+  severity     AlertSeverity
+  status       AlertStatus   @default(ACTIVE)
+  type         String
+  description  String
+  ipAddress    String?
+  userId       String?
+  metadata     Json?
+  resolvedAt   DateTime?
+  resolvedById String?
+  resolvedNote String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([status])
+  @@index([severity])
+  @@index([ipAddress])
+  @@index([createdAt])
+  @@map("fraud_alerts")
+}
+
+model BlockedIp {
+  id          String    @id @default(uuid())
+  ipAddress   String    @unique
+  reason      String
+  blockedById String?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([ipAddress])
+  @@map("blocked_ips")
+}

@@ -1,0 +1,18 @@
+node_modules/
+dist/
+
+# Environment files — never commit these
+.env
+.env.*
+.env.example
+
+# Prisma
+prisma/migrations/dev/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
