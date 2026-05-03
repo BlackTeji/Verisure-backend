@@ -1,4 +1,3 @@
-import 'dotenv/config'
 import Fastify from 'fastify'
 import FastifyCors from '@fastify/cors'
 import FastifyHelmet from '@fastify/helmet'
@@ -20,12 +19,7 @@ import verifierRoutes from './routes/verifiers/index.js'
 import adminRoutes from './routes/admin/index.js'
 
 const app = Fastify({
-    logger: {
-        level: env.LOG_LEVEL,
-        ...(env.LOG_PRETTY
-            ? { transport: { target: 'pino-pretty', options: { colorize: true } } }
-            : {}),
-    },
+    logger: logger as any,
     trustProxy: true,
     requestTimeout: 30000,
     bodyLimit: 1_048_576,
@@ -33,7 +27,7 @@ const app = Fastify({
 
 // ── PLUGINS ───────────────────────────────────────────────────
 await app.register(FastifyHelmet, {
-    contentSecurityPolicy: env.NODE_ENV === 'production',
+    contentSecurityPolicy: { directives: { defaultSrc: ["'none'"], scriptSrc: ["'none'"], styleSrc: ["'none'"], imgSrc: ["'none'"] } },
     crossOriginEmbedderPolicy: true,
     crossOriginOpenerPolicy: true,
     dnsPrefetchControl: { allow: false },
@@ -92,15 +86,12 @@ await app.register(verifierRoutes, { prefix: '/api/v1/verifiers' })
 await app.register(adminRoutes, { prefix: '/api/v1/admin' })
 
 // ── ERROR HANDLERS ────────────────────────────────────────────
+app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not found' }))
+
 app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, 'unhandled error')
     if (env.NODE_ENV === 'production') return reply.status(500).send({ error: 'Internal server error' })
-    const e = err as any
-    return reply.status(e.statusCode ?? 500).send({
-        error: e.name,
-        message: e.message,
-        stack: env.NODE_ENV === 'development' ? e.stack : undefined,
-    })
+    return reply.status((err as any).statusCode ?? 500).send({ error: err.name, message: err.message, stack: env.NODE_ENV === 'development' ? err.stack : undefined })
 })
 
 // ── STARTUP ───────────────────────────────────────────────────
@@ -108,7 +99,23 @@ async function start() {
     try {
         await db.$connect()
         logger.info('db: connected')
-        await syncBlockedIpsFromDb()
+
+        // Run migrations programmatically — ensures tables exist before server starts
+        const { execSync } = await import('child_process')
+        try {
+            execSync('npx prisma migrate deploy', { stdio: 'inherit' })
+            logger.info('db: migrations applied')
+        } catch (err) {
+            logger.warn({ err }, 'db: migration failed — tables may already exist, continuing')
+        }
+
+        // Sync blocked IPs — non-fatal if tables missing
+        try {
+            await syncBlockedIpsFromDb()
+        } catch (err) {
+            logger.warn({ err }, 'startup: syncBlockedIps failed — continuing without blocked IP cache')
+        }
+
         await app.listen({ port: env.PORT, host: env.HOST })
         logger.info(`server: listening on ${env.HOST}:${env.PORT}`)
     } catch (err) {
