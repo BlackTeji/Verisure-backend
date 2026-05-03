@@ -6,8 +6,8 @@ import FastifySwagger from '@fastify/swagger'
 import FastifySwaggerUi from '@fastify/swagger-ui'
 import FastifyCookie from '@fastify/cookie'
 import { env } from './config/env.js'
-import { logger } from './lib/logger.js'
 import { redis } from './lib/redis.js'
+import { logger } from './lib/logger.js'
 import { db } from './lib/db.js'
 import { checkBlockedIp, syncBlockedIpsFromDb } from './hooks/rate-limit.js'
 
@@ -19,7 +19,13 @@ import verifierRoutes from './routes/verifiers/index.js'
 import adminRoutes from './routes/admin/index.js'
 
 const app = Fastify({
-    logger: logger as any,
+    logger: {
+        level: env.LOG_LEVEL,
+        redact: {
+            paths: ['req.headers.authorization', 'req.headers.cookie', 'body.password', 'body.passwordHash'],
+            censor: '[REDACTED]',
+        },
+    },
     trustProxy: true,
     requestTimeout: 30000,
     bodyLimit: 1_048_576,
