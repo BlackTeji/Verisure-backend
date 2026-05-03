@@ -91,7 +91,7 @@ app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not fou
 app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, 'unhandled error')
     if (env.NODE_ENV === 'production') return reply.status(500).send({ error: 'Internal server error' })
-    return reply.status((err as any).statusCode ?? 500).send({ error: err.name, message: err.message, stack: env.NODE_ENV === 'development' ? err.stack : undefined })
+    const e = err as any; return reply.status(e.statusCode ?? 500).send({ error: e.name, message: e.message, stack: env.NODE_ENV === 'development' ? e.stack : undefined })
 })
 
 // ── STARTUP ───────────────────────────────────────────────────
