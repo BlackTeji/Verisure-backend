@@ -14,7 +14,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
 
     app.post('/', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const body = z.object({
-            holderName: z.string().min(1).max(200),
+            holderName: z.string().min(1).max(200).optional(),
             holderEmail: z.string().email().toLowerCase(),
             credentialType: z.string().min(1).max(100),
             field: z.string().max(100).optional(),
@@ -29,9 +29,17 @@ export default async function credentialRoutes(app: FastifyInstance) {
         const issuerId = req.issuerId!
         const id = generateCredentialId()
 
+        // Auto-resolve holder name from their registered account if not provided
+        let holderName = d.holderName
+        if (!holderName) {
+            const holderUser = await db.user.findUnique({ where: { email: d.holderEmail }, select: { firstName: true, lastName: true, email: true } })
+            if (!holderUser) return reply.status(404).send({ error: 'Holder not found', message: `No VeriSure account found for ${d.holderEmail}. The holder must register first.` })
+            holderName = [holderUser.firstName, holderUser.lastName].filter(Boolean).join(' ') || holderUser.email
+        }
+
         const sha256Hash = hashCredential({
             id, issuerId,
-            holderName: d.holderName,
+            holderName,
             holderEmail: d.holderEmail,
             credentialType: d.credentialType,
             field: d.field ?? null,
@@ -41,7 +49,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         })
 
         const credential = await db.credential.create({
-            data: { id, issuerId, holderName: d.holderName, holderEmail: d.holderEmail, credentialType: d.credentialType, field: d.field ?? null, notes: d.notes ?? null, issueDate: new Date(d.issueDate), expiryDate: d.expiryDate ? new Date(d.expiryDate) : null, sha256Hash, status: 'ACTIVE' },
+            data: { id, issuerId, holderName, holderEmail: d.holderEmail, credentialType: d.credentialType, field: d.field ?? null, notes: d.notes ?? null, issueDate: new Date(d.issueDate), expiryDate: d.expiryDate ? new Date(d.expiryDate) : null, sha256Hash, status: 'ACTIVE' },
             select: { id: true, credentialType: true, holderName: true, holderEmail: true, issueDate: true, expiryDate: true, sha256Hash: true, status: true },
         })
 
@@ -49,7 +57,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         await db.credential.update({ where: { id }, data: { anchorJobId: anchorJob.id } })
 
         const issuer = await db.issuerProfile.findUnique({ where: { id: issuerId }, select: { institutionName: true } })
-        await emailQueue.add('credential_issued', { type: 'credential_issued', to: d.holderEmail, data: { holderName: d.holderName, credentialType: d.credentialType, issuerName: issuer?.institutionName ?? '', credentialId: id, verifyUrl: `${env.FRONTEND_URL}/verify?credential_id=${id}` } })
+        await emailQueue.add('credential_issued', { type: 'credential_issued', to: d.holderEmail, data: { holderName, credentialType: d.credentialType, issuerName: issuer?.institutionName ?? '', credentialId: id, verifyUrl: `${env.FRONTEND_URL}/verify?credential_id=${id}` } })
 
         audit({ action: 'CREDENTIAL_ISSUED', req, targetType: 'credential', targetId: id, metadata: { credentialType: d.credentialType, holderEmail: d.holderEmail } })
 

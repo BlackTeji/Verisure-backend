@@ -12,6 +12,33 @@ export default async function verifierRoutes(app: FastifyInstance) {
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireVerifier)
 
+    // ── PROFILE ───────────────────────────────────────────────────
+    app.get('/me', async (req, reply) => {
+        const user = await db.user.findUnique({
+            where: { id: req.userId! },
+            select: {
+                id: true, email: true, firstName: true, lastName: true, role: true, createdAt: true,
+                verifierProfile: { select: { id: true, organisationName: true, organisationType: true, teamSize: true } }
+            }
+        })
+        if (!user) return reply.status(404).send({ error: 'Not found' })
+        return reply.status(200).send({ user })
+    })
+
+    app.patch('/me', async (req, reply) => {
+        const body = z.object({
+            organisationName: z.string().min(1).max(200).optional(),
+            organisationType: z.string().max(100).optional(),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+        const profile = await db.verifierProfile.update({
+            where: { id: req.verifierId! },
+            data: body.data,
+            select: { id: true, organisationName: true, organisationType: true }
+        })
+        return reply.status(200).send({ profile })
+    })
+
     // ── API KEYS ──────────────────────────────────────────────────
     app.get('/me/api-keys', async (req, reply) => {
         const apiKeys = await db.apiKey.findMany({ where: { verifierId: req.verifierId!, isActive: true }, select: { id: true, name: true, keyPrefix: true, environment: true, scopes: true, lastUsedAt: true, lastUsedIp: true, callCount: true, createdAt: true }, orderBy: { createdAt: 'desc' } })
