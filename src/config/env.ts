@@ -26,6 +26,7 @@ const schema = z.object({
     POLYGON_ANCHOR_CONTRACT: z.string(),
     POLYGON_PRIVATE_KEY: z.string(),
     POLYGON_MIN_BALANCE: z.coerce.number().default(0.1),
+    POLYGON_NETWORK: z.string().optional(),
 
     SMTP_HOST: z.string(),
     SMTP_PORT: z.coerce.number(),

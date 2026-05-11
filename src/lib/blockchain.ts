@@ -3,9 +3,6 @@ import { env } from '../config/env.js'
 import { logger } from './logger.js'
 import { db } from './db.js'
 
-// ── CONTRACT ABI ──────────────────────────────────────────────
-// Matches VeriSureAnchor.sol exactly.
-// The anchor() function takes a bytes32 hash and emits Anchored.
 const ABI = [
     'function anchor(bytes32 hash) external',
     'function isAnchored(bytes32 hash) external view returns (bool, uint256)',
@@ -13,9 +10,6 @@ const ABI = [
 ]
 
 // ── SINGLETON ─────────────────────────────────────────────────
-// Lazily initialised and reset on any provider/network failure.
-// Singleton is intentional — avoids opening a new WSS/HTTPS connection
-// per job when the anchor worker processes credentials concurrently.
 let _provider: ethers.JsonRpcProvider | null = null
 let _wallet: ethers.Wallet | null = null
 let _contract: ethers.Contract | null = null
@@ -39,18 +33,19 @@ function getInstances() {
     return { provider: _provider!, wallet: _wallet!, contract: _contract! }
 }
 
-// Derive network name from env so testnet credentials don't claim mainnet.
-// Set POLYGON_NETWORK=polygon-amoy in Railway for testnet,
-// POLYGON_NETWORK=polygon-mainnet for production.
+// ── NETWORK NAME ──────────────────────────────────────────────
+// Reads POLYGON_NETWORK from env if set, otherwise infers from RPC URL.
+// Add this line to src/config/env.ts inside the schema object,
+// after POLYGON_MIN_BALANCE:
+//   POLYGON_NETWORK: z.string().optional(),
 function networkName(): string {
-    return env.POLYGON_NETWORK ?? (
-        env.POLYGON_RPC_URL?.includes('amoy') ? 'polygon-amoy' : 'polygon-mainnet'
-    )
+    const fromEnv = (env as Record<string, unknown>)['POLYGON_NETWORK'] as string | undefined
+    if (fromEnv) return fromEnv
+    return env.POLYGON_RPC_URL?.includes('amoy') ? 'polygon-amoy' : 'polygon-mainnet'
 }
 
-// ── GAS CONSTANTS ─────────────────────────────────────────────
-const GAS_BUFFER_PCT = 130n   // 30% headroom over estimate
-const GAS_CAP = 500_000n  // hard cap — protects wallet if estimateGas misbehaves
+const GAS_BUFFER_PCT = 130n
+const GAS_CAP = 500_000n
 
 // ── WALLET BALANCE ────────────────────────────────────────────
 export async function checkAnchorWalletBalance() {
@@ -70,10 +65,6 @@ export async function checkAnchorWalletBalance() {
 }
 
 // ── ANCHOR ────────────────────────────────────────────────────
-// BullMQ owns retry logic (3 attempts, exponential backoff in queue.ts).
-// This function throws on failure — the worker lets BullMQ handle retries.
-// Do NOT add recursive retry here; it compounds with BullMQ retries (3 × 3 = 9 attempts).
-
 export interface AnchorResult {
     txHash: string
     blockNumber: number
@@ -83,21 +74,12 @@ export interface AnchorResult {
 }
 
 export async function anchorHash(credentialId: string, sha256Hash: string): Promise<AnchorResult> {
-    // sha256Hash arrives as a hex string without 0x prefix.
-    // Solidity expects bytes32 — ethers needs the 0x prefix.
     if (sha256Hash.length !== 64) {
         throw new Error(`Invalid SHA-256 hash length: expected 64 hex chars, got ${sha256Hash.length}`)
     }
     const hashBytes = ('0x' + sha256Hash) as `0x${string}`
 
-    let instances: ReturnType<typeof getInstances>
-    try {
-        instances = getInstances()
-    } catch (err) {
-        throw err  // env not configured — don't reset, surface clearly
-    }
-
-    const { contract } = instances
+    const { contract } = getInstances()
     const fn = contract.getFunction('anchor')
 
     logger.info({ credentialId, sha256Hash, network: networkName() }, 'blockchain: estimating gas')
@@ -107,10 +89,9 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
         const estimate = await fn.estimateGas(hashBytes)
         gasLimit = BigInt(Math.min(Number((estimate * GAS_BUFFER_PCT) / 100n), Number(GAS_CAP)))
     } catch (err: any) {
-        // estimateGas reverts if hash is already anchored — catch and surface clearly
-        const msg = err?.message ?? ''
+        const msg: string = err?.message ?? ''
         if (msg.includes('Already anchored')) {
-            logger.warn({ credentialId }, 'blockchain: hash already on-chain — marking as anchored')
+            logger.warn({ credentialId }, 'blockchain: hash already on-chain — recovering')
             return recoverAlreadyAnchored(credentialId, sha256Hash)
         }
         resetInstances()
@@ -127,11 +108,11 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
         throw new Error(`Tx submission failed: ${err?.message ?? err}`)
     }
 
-    logger.info({ credentialId, txHash: tx.hash }, 'blockchain: tx submitted — awaiting confirmation')
+    logger.info({ credentialId, txHash: tx.hash }, 'blockchain: awaiting confirmation')
 
     let receipt: ethers.TransactionReceipt | null
     try {
-        receipt = await tx.wait(2)  // wait for 2 confirmations
+        receipt = await tx.wait(2)
     } catch (err: any) {
         throw new Error(`Tx confirmation failed (txHash: ${tx.hash}): ${err?.message ?? err}`)
     }
@@ -148,8 +129,6 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
         network: networkName(),
     }
 
-    // Write txHash + blockNumber back to the credential record.
-
     await db.credential.update({
         where: { id: credentialId },
         data: {
@@ -160,12 +139,11 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
         },
     })
 
-    logger.info({ credentialId, txHash: result.txHash, blockNumber: result.blockNumber, gasUsed: result.gasUsed }, 'blockchain: confirmed')
+    logger.info({ credentialId, txHash: result.txHash, blockNumber: result.blockNumber }, 'blockchain: confirmed')
     return result
 }
 
 // ── RECOVER ALREADY-ANCHORED ──────────────────────────────────
-
 async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string): Promise<AnchorResult> {
     const { contract, provider } = getInstances()
     const hashBytes = '0x' + sha256Hash
@@ -173,14 +151,22 @@ async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string):
     const currentBlock = await provider.getBlockNumber()
     const fromBlock = Math.max(0, currentBlock - 100_000)
 
-    const filter = contract.filters.Anchored(hashBytes)
+    // Bracket notation required — contract.filters is an index signature type in ethers v6
+    const filterFn = contract.filters['Anchored']
+    if (typeof filterFn !== 'function') {
+        throw new Error('Anchored filter not found on contract — check ABI')
+    }
+    const filter = (filterFn as (...args: unknown[]) => ethers.ContractEventName)(hashBytes)
     const events = await contract.queryFilter(filter, fromBlock, currentBlock)
 
-    if (events.length === 0) {
-        throw new Error(`Hash reported as already anchored but no event found for ${sha256Hash}`)
+    if (!events.length) {
+        throw new Error(`Hash reported as already anchored but no Anchored event found for ${sha256Hash}`)
     }
 
+    // Guard: events[0] could theoretically be undefined in loose TS configs
     const event = events[0]
+    if (!event) throw new Error('Event lookup returned undefined')
+
     const receipt = await provider.getTransactionReceipt(event.transactionHash)
     if (!receipt) throw new Error(`Could not fetch receipt for recovered tx ${event.transactionHash}`)
 
@@ -207,8 +193,6 @@ async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string):
 }
 
 // ── VERIFY ON-CHAIN ───────────────────────────────────────────
-// Called by the verification route to confirm a txHash contains
-// the expected credential hash. Returns false (not throws) on any failure.
 export async function verifyHashOnChain(txHash: string, expectedHash: string): Promise<boolean> {
     try {
         const { provider } = getInstances()
@@ -233,8 +217,7 @@ export async function verifyHashOnChain(txHash: string, expectedHash: string): P
     }
 }
 
-// ── CONTRACT ADDRESS HELPER ───────────────────────────────────
-// Used by admin health endpoint to confirm contract is reachable.
+// ── CONTRACT PING ─────────────────────────────────────────────
 export async function pingContract(): Promise<{ ok: boolean; network: string; contract: string }> {
     try {
         const { provider } = getInstances()
