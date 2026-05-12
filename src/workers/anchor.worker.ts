@@ -3,40 +3,29 @@ import { redis } from '../lib/redis.js'
 import { logger } from '../lib/logger.js'
 import { anchorHash, checkAnchorWalletBalance, pingContract } from '../lib/blockchain.js'
 import { db } from '../lib/db.js'
+import { QUEUES } from '../lib/queue.js'
 import type { AnchorJobData } from '../lib/queue.js'
 
 // ── STARTUP ───────────────────────────────────────────────────
 logger.info('anchor-worker: starting')
 
-// Confirm RPC + contract is reachable before accepting any jobs.
-// Logs a warning but does NOT exit — jobs will fail individually
-// and BullMQ will retry. This is intentional: a cold-start RPC
-// timeout shouldn't prevent the worker from processing later.
 pingContract().then(({ ok, network, contract }) => {
     if (ok) logger.info({ network, contract }, 'anchor-worker: contract reachable')
     else logger.error({ network, contract }, 'anchor-worker: contract NOT reachable — check POLYGON_RPC_URL and POLYGON_ANCHOR_CONTRACT')
 }).catch(err => logger.error({ err }, 'anchor-worker: contract ping failed'))
 
-// Check wallet balance. Low balance = credentials will fail to anchor.
-// Alert loudly but do not exit.
 checkAnchorWalletBalance().then(b => {
-    if (!b.isSufficient) {
+    if (!b.isSufficient)
         logger.error({ balance: b.balanceMatic, address: b.address },
             'anchor-worker: WALLET BALANCE LOW — top up MATIC or anchoring will fail')
-    } else {
+    else
         logger.info({ balance: b.balanceMatic, address: b.address }, 'anchor-worker: wallet balance ok')
-    }
 }).catch(err => logger.error({ err }, 'anchor-worker: wallet balance check failed'))
 
 // ── WORKER ────────────────────────────────────────────────────
-// concurrency: 5 — process up to 5 credentials in parallel.
-// limiter: 10 anchor calls/sec max — respects Polygon RPC rate limits
-//   on free Alchemy/QuickNode tiers (300 req/sec — well within budget).
-// BullMQ handles retries: 3 attempts, exponential backoff (see queue.ts).
-// Do NOT add retry logic inside the job handler — it doubles up with BullMQ.
 
 const worker = new Worker<AnchorJobData>(
-    'vrs:anchor',
+    QUEUES.ANCHOR,
     async job => {
         const { credentialId, sha256Hash } = job.data
 
@@ -50,7 +39,6 @@ const worker = new Worker<AnchorJobData>(
         })
 
         if (!cred) {
-            // Credential deleted between issuance and anchoring — discard job silently.
             logger.warn({ credentialId }, 'anchor-worker: credential not found — discarding job')
             return
         }
@@ -68,8 +56,6 @@ const worker = new Worker<AnchorJobData>(
         }
 
         await job.updateProgress(10)
-
-        // ── Anchor ────────────────────────────────────────────
 
         const result = await anchorHash(credentialId, sha256Hash)
 

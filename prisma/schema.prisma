@@ -282,7 +282,7 @@ model VerifierProfile {
 }
 
 model Credential {
-  id                String           @id
+  id                String           @id @default(dbgenerated("gen_random_uuid()"))
   issuerId          String
   holderUserId      String?
   holderName        String
@@ -335,13 +335,14 @@ model VerificationLog {
   country        String?
   verifiedAt     DateTime           @default(now())
 
-  credential Credential      @relation(fields: [credentialId], references: [id])
+  credential Credential       @relation(fields: [credentialId], references: [id])
   verifier   VerifierProfile? @relation(fields: [verifierId], references: [id])
   apiKey     ApiKey?          @relation(fields: [apiKeyId], references: [id])
 
   @@index([credentialId])
   @@index([verifierId])
   @@index([verifiedAt])
+  @@index([credentialId, verifiedAt(sort: Desc)])
   @@map("verification_logs")
 }
 
@@ -462,7 +463,7 @@ model AuditLog {
   actorId    String?
   actorEmail String?
   actorRole  String?
-  actorIp    String
+  actorIp    String?
   actorAgent String?
   targetType String?
   targetId   String?

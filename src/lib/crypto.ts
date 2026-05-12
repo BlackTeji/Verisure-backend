@@ -1,18 +1,31 @@
 import {
     createHash, createCipheriv, createDecipheriv,
-    randomBytes, timingSafeEqual,
+    randomBytes, timingSafeEqual, randomUUID,
 } from 'crypto'
 import { env } from '../config/env.js'
 
-// ── IDs ──────────────────────────────────────────────────────
+// ── IDs ───────────────────────────────────────────────────────
 export function generateCredentialId(): string {
-    const b = randomBytes(8).toString('hex')
-    return `VS-${b.slice(0, 8)}-${b.slice(8, 12)}-${b.slice(12, 16)}`
+    const b = randomBytes(16).toString('hex')
+    return `VS-${b.slice(0, 8)}-${b.slice(8, 12)}-${b.slice(12, 16)}-${b.slice(16, 20)}-${b.slice(20, 32)}`
 }
 
 // ── HASHING ───────────────────────────────────────────────────
 export function sha256(data: string): string {
     return createHash('sha256').update(data, 'utf8').digest('hex')
+}
+
+function canonicalJSON(obj: Record<string, unknown>): string {
+    const entries = Object.entries(obj)
+        .filter(([, v]) => v !== null && v !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b))
+
+    const parts = entries.map(([k, v]) => {
+        const key = JSON.stringify(k)
+        const value = typeof v === 'string' ? JSON.stringify(v) : String(v)
+        return `${key}:${value}`
+    })
+    return '{' + parts.join(',') + '}'
 }
 
 export function hashCredential(f: {
@@ -22,18 +35,11 @@ export function hashCredential(f: {
     holderEmail: string
     credentialType: string
     field?: string | null
-    issueDate: string
+    issueDate: string 
     expiryDate?: string | null
     notes?: string | null
 }): string {
-    const canonical = JSON.stringify(
-        Object.fromEntries(
-            Object.entries(f)
-                .filter(([, v]) => v !== null && v !== undefined)
-                .sort(([a], [b]) => a.localeCompare(b))
-        )
-    )
-    return sha256(canonical)
+    return sha256(canonicalJSON(f as unknown as Record<string, unknown>))
 }
 
 export function secureCompare(a: string, b: string): boolean {

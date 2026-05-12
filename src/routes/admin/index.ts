@@ -17,14 +17,33 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── ISSUERS ───────────────────────────────────────────────────
     app.get('/issuers', async (req, reply) => {
-        const query = z.object({ status: z.enum(['PENDING', 'APPROVED', 'SUSPENDED', 'FROZEN']).optional(), page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25), search: z.string().optional() }).safeParse(req.query)
+        const query = z.object({
+            status: z.enum(['PENDING', 'APPROVED', 'SUSPENDED', 'FROZEN']).optional(),
+            page: z.coerce.number().int().min(1).default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(25),
+            search: z.string().optional(),
+        }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
 
         const { status, page, limit, search } = query.data
-        const where: any = { ...(status ? { status } : {}), ...(search ? { OR: [{ institutionName: { contains: search, mode: 'insensitive' } }, { officialEmail: { contains: search, mode: 'insensitive' } }] } : {}) }
+        const where: any = {
+            ...(status ? { status } : {}),
+            ...(search ? {
+                OR: [
+                    { institutionName: { contains: search, mode: 'insensitive' } },
+                    { officialEmail: { contains: search, mode: 'insensitive' } },
+                ]
+            } : {}),
+        }
 
         const [issuers, total] = await db.$transaction([
-            db.issuerProfile.findMany({ where, include: { user: { select: { email: true, createdAt: true, lastLoginAt: true } }, _count: { select: { credentials: true } } }, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
+            db.issuerProfile.findMany({
+                where,
+                include: { user: { select: { email: true, createdAt: true, lastLoginAt: true, emailVerified: true } }, _count: { select: { credentials: true } } },
+                orderBy: { createdAt: 'desc' },
+                skip: (page - 1) * limit,
+                take: limit,
+            }),
             db.issuerProfile.count({ where }),
         ])
 
@@ -33,14 +52,35 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     app.patch('/issuers/:id/approve', async (req, reply) => {
         const { id } = req.params as { id: string }
-        const issuer = await db.issuerProfile.findUnique({ where: { id }, include: { user: { select: { email: true, firstName: true } } } })
+        const issuer = await db.issuerProfile.findUnique({
+            where: { id },
+            include: { user: { select: { email: true, firstName: true, emailVerified: true } } },
+        })
         if (!issuer) return reply.status(404).send({ error: 'Not found' })
         if (issuer.status !== 'PENDING') return reply.status(409).send({ error: 'Conflict', message: 'Not pending' })
 
-        await db.issuerProfile.update({ where: { id }, data: { status: 'APPROVED', approvedAt: new Date(), approvedById: req.userId } })
+        if (!issuer.user.emailVerified) {
+            return reply.status(422).send({
+                error: 'Unprocessable',
+                message: 'Institution email not verified. Ask the applicant to verify their email before approval.',
+            })
+        }
+
+        await db.issuerProfile.update({
+            where: { id },
+            data: { status: 'APPROVED', approvedAt: new Date(), approvedById: req.userId },
+        })
         await redis.del(keys.issuerStatus(id))
 
-        await emailQueue.add('issuer_approved', { type: 'issuer_approved', to: issuer.officialEmail, data: { contactName: `${issuer.contactFirstName} ${issuer.contactLastName}`, institutionName: issuer.institutionName, dashboardUrl: `${process.env['FRONTEND_URL']}/dashboard` } })
+        await emailQueue.add('issuer_approved', {
+            type: 'issuer_approved',
+            to: issuer.officialEmail,
+            data: {
+                contactName: `${issuer.contactFirstName} ${issuer.contactLastName}`,
+                institutionName: issuer.institutionName,
+                dashboardUrl: `${process.env['FRONTEND_URL']}/pages/dashboard-issuer.html`,
+            },
+        })
 
         audit({ action: 'ISSUER_APPROVED', req, targetType: 'issuer', targetId: id, metadata: { institutionName: issuer.institutionName } })
 
@@ -55,7 +95,10 @@ export default async function adminRoutes(app: FastifyInstance) {
         const issuer = await db.issuerProfile.findUnique({ where: { id } })
         if (!issuer) return reply.status(404).send({ error: 'Not found' })
 
-        await db.issuerProfile.update({ where: { id }, data: { status: 'SUSPENDED', suspendedAt: new Date(), suspendedReason: body.data.reason } })
+        await db.issuerProfile.update({
+            where: { id },
+            data: { status: 'SUSPENDED', suspendedAt: new Date(), suspendedReason: body.data.reason },
+        })
         await redis.del(keys.issuerStatus(id))
 
         audit({ action: 'ISSUER_SUSPENDED', req, targetType: 'issuer', targetId: id, metadata: { reason: body.data.reason } })
@@ -65,14 +108,34 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── USERS ─────────────────────────────────────────────────────
     app.get('/users', async (req, reply) => {
-        const query = z.object({ role: z.enum(['HOLDER', 'ISSUER', 'VERIFIER', 'ADMIN']).optional(), page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25), search: z.string().optional() }).safeParse(req.query)
+        const query = z.object({
+            role: z.enum(['HOLDER', 'ISSUER', 'VERIFIER', 'ADMIN']).optional(),
+            page: z.coerce.number().int().min(1).default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(25),
+            search: z.string().optional(),
+        }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
 
         const { role, page, limit, search } = query.data
-        const where: any = { ...(role ? { role } : {}), ...(search ? { OR: [{ email: { contains: search, mode: 'insensitive' } }, { firstName: { contains: search, mode: 'insensitive' } }, { lastName: { contains: search, mode: 'insensitive' } }] } : {}) }
+        const where: any = {
+            ...(role ? { role } : {}),
+            ...(search ? {
+                OR: [
+                    { email: { contains: search, mode: 'insensitive' } },
+                    { firstName: { contains: search, mode: 'insensitive' } },
+                    { lastName: { contains: search, mode: 'insensitive' } },
+                ]
+            } : {}),
+        }
 
         const [users, total] = await db.$transaction([
-            db.user.findMany({ where, select: { id: true, email: true, role: true, firstName: true, lastName: true, isActive: true, isSuspended: true, emailVerified: true, createdAt: true, lastLoginAt: true }, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
+            db.user.findMany({
+                where,
+                select: { id: true, email: true, role: true, firstName: true, lastName: true, isActive: true, isSuspended: true, emailVerified: true, createdAt: true, lastLoginAt: true },
+                orderBy: { createdAt: 'desc' },
+                skip: (page - 1) * limit,
+                take: limit,
+            }),
             db.user.count({ where }),
         ])
 
@@ -93,11 +156,26 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── AUDIT LOGS ────────────────────────────────────────────────
     app.get('/audit', async (req, reply) => {
-        const query = z.object({ page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(50), action: z.string().optional(), actorId: z.string().optional(), targetType: z.string().optional(), targetId: z.string().optional(), from: z.string().datetime().optional(), to: z.string().datetime().optional() }).safeParse(req.query)
+        const query = z.object({
+            page: z.coerce.number().int().min(1).default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(50),
+            action: z.string().optional(),
+            actorId: z.string().optional(),
+            targetType: z.string().optional(),
+            targetId: z.string().optional(),
+            from: z.string().datetime().optional(),
+            to: z.string().datetime().optional(),
+        }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
 
         const { page, limit, action, actorId, targetType, targetId, from, to } = query.data
-        const where: any = { ...(action ? { action } : {}), ...(actorId ? { actorId } : {}), ...(targetType ? { targetType } : {}), ...(targetId ? { targetId } : {}), ...(from || to ? { createdAt: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } } : {}) }
+        const where: any = {
+            ...(action ? { action } : {}),
+            ...(actorId ? { actorId } : {}),
+            ...(targetType ? { targetType } : {}),
+            ...(targetId ? { targetId } : {}),
+            ...(from || to ? { createdAt: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } } : {}),
+        }
 
         const [logs, total] = await db.$transaction([
             db.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
@@ -109,7 +187,12 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── FRAUD ALERTS ──────────────────────────────────────────────
     app.get('/fraud-alerts', async (req, reply) => {
-        const query = z.object({ status: z.enum(['ACTIVE', 'RESOLVED', 'DISMISSED']).optional(), severity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(), page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25) }).safeParse(req.query)
+        const query = z.object({
+            status: z.enum(['ACTIVE', 'RESOLVED', 'DISMISSED']).optional(),
+            severity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(),
+            page: z.coerce.number().int().min(1).default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(25),
+        }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
 
         const { status, severity, page, limit } = query.data
@@ -126,7 +209,10 @@ export default async function adminRoutes(app: FastifyInstance) {
     app.patch('/fraud-alerts/:id/resolve', async (req, reply) => {
         const { id } = req.params as { id: string }
         const body = z.object({ note: z.string().optional() }).safeParse(req.body)
-        await db.fraudAlert.update({ where: { id }, data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedById: req.userId, resolvedNote: body.success ? (body.data.note ?? null) : null } })
+        await db.fraudAlert.update({
+            where: { id },
+            data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedById: req.userId, resolvedNote: body.success ? (body.data.note ?? null) : null },
+        })
         audit({ action: 'FRAUD_ALERT_RESOLVED', req, targetType: 'fraud_alert', targetId: id })
         return reply.status(200).send({ message: 'Alert resolved' })
     })
@@ -137,7 +223,7 @@ export default async function adminRoutes(app: FastifyInstance) {
         const alert = await db.fraudAlert.findUnique({ where: { id }, select: { ipAddress: true } })
         if (!alert?.ipAddress) return reply.status(404).send({ error: 'No IP on this alert' })
 
-        const ttl = body.success && !body.data.permanent ? 86400 : undefined
+        const ttl = body.success && !body.data.permanent ? 86_400 : undefined
         await blockIp(alert.ipAddress, `Admin block — alert ${id}`, ttl)
         await db.fraudAlert.update({ where: { id }, data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedById: req.userId, resolvedNote: 'IP blocked' } })
 
@@ -154,13 +240,17 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── ANALYTICS ─────────────────────────────────────────────────
     app.get('/analytics', async (req, reply) => {
-        const [totalCredentials, totalVerifications, totalUsers, activeIssuers, credsByStatus, last24h, topIssuers, topVerifiers] = await Promise.all([
+        const [
+            totalCredentials, totalVerifications, totalUsers,
+            activeIssuers, credsByStatus, last24h,
+            topIssuers, topVerifiers,
+        ] = await Promise.all([
             db.credential.count(),
             db.verificationLog.count(),
             db.user.count(),
             db.issuerProfile.count({ where: { status: 'APPROVED' } }),
             db.credential.groupBy({ by: ['status'], _count: true }),
-            db.verificationLog.count({ where: { verifiedAt: { gte: new Date(Date.now() - 86400000) } } }),
+            db.verificationLog.count({ where: { verifiedAt: { gte: new Date(Date.now() - 86_400_000) } } }),
             db.issuerProfile.findMany({ where: { status: 'APPROVED' }, include: { _count: { select: { credentials: true } } }, orderBy: { credentials: { _count: 'desc' } }, take: 10 }),
             db.verifierProfile.findMany({ include: { _count: { select: { verifications: true } } }, orderBy: { verifications: { _count: 'desc' } }, take: 10 }),
         ])
@@ -175,7 +265,10 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── HEALTH ────────────────────────────────────────────────────
     app.get('/health', async (req, reply) => {
-        const [queueHealth, walletBalance] = await Promise.all([getQueueHealth(), checkAnchorWalletBalance().catch(err => ({ error: String(err) }))])
+        const [queueHealth, walletBalance] = await Promise.all([
+            getQueueHealth(),
+            checkAnchorWalletBalance().catch(err => ({ error: String(err) })),
+        ])
 
         let dbStatus: 'ok' | 'error' = 'ok'
         try { await db.$queryRaw`SELECT 1` } catch { dbStatus = 'error' }
@@ -183,6 +276,11 @@ export default async function adminRoutes(app: FastifyInstance) {
         let redisStatus: 'ok' | 'error' = 'ok'
         try { await redis.ping() } catch { redisStatus = 'error' }
 
-        return reply.status(200).send({ timestamp: new Date().toISOString(), services: { database: dbStatus, redis: redisStatus }, queues: queueHealth, blockchain: walletBalance })
+        return reply.status(200).send({
+            timestamp: new Date().toISOString(),
+            services: { database: dbStatus, redis: redisStatus },
+            queues: queueHealth,
+            blockchain: walletBalance,
+        })
     })
 }

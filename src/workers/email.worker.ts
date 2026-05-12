@@ -2,12 +2,13 @@ import { Worker } from 'bullmq'
 import { redis } from '../lib/redis.js'
 import { logger } from '../lib/logger.js'
 import { sendEmail, templates } from '../lib/mailer.js'
+import { QUEUES } from '../lib/queue.js'
 import type { EmailJobData } from '../lib/queue.js'
 
 logger.info('email-worker: starting')
 
 const worker = new Worker<EmailJobData>(
-    'vrs:email',
+    QUEUES.EMAIL,
     async job => {
         const { type, to, name, data } = job.data
         logger.info({ type, to, jobId: job.id }, 'email-worker: processing')
@@ -32,6 +33,11 @@ const worker = new Worker<EmailJobData>(
     { connection: redis, concurrency: 10, limiter: { max: 30, duration: 1000 } }
 )
 
-worker.on('failed', (job, err) => logger.error({ jobId: job?.id, err }, 'email-worker: job failed'))
+worker.on('failed', (job, err) =>
+    logger.error({ jobId: job?.id, type: job?.data?.type, to: job?.data?.to, err }, 'email-worker: job failed'))
 
-process.on('SIGTERM', async () => { logger.info('email-worker: stopping'); await worker.close(); process.exit(0) })
+process.on('SIGTERM', async () => {
+    logger.info('email-worker: stopping')
+    await worker.close()
+    process.exit(0)
+})

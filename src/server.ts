@@ -27,19 +27,21 @@ const app = Fastify({
         },
     },
     trustProxy: true,
-    requestTimeout: 30000,
+    requestTimeout: 30_000,
     bodyLimit: 1_048_576,
 })
 
 // ── PLUGINS ───────────────────────────────────────────────────
 await app.register(FastifyHelmet, {
-    contentSecurityPolicy: { directives: { defaultSrc: ["'none'"], scriptSrc: ["'none'"], styleSrc: ["'none'"], imgSrc: ["'none'"] } },
+    contentSecurityPolicy: {
+        directives: { defaultSrc: ["'none'"], scriptSrc: ["'none'"], styleSrc: ["'none'"], imgSrc: ["'none'"] },
+    },
     crossOriginEmbedderPolicy: true,
     crossOriginOpenerPolicy: true,
     dnsPrefetchControl: { allow: false },
     frameguard: { action: 'deny' },
     hidePoweredBy: true,
-    hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
+    hsts: { maxAge: 63_072_000, includeSubDomains: true, preload: true },
     noSniff: true,
     referrerPolicy: { policy: 'no-referrer' },
 })
@@ -63,11 +65,22 @@ await app.register(FastifyRateLimit, {
     timeWindow: env.RATE_LIMIT_PUBLIC_WINDOW_MS,
     redis,
     keyGenerator: (req: any) => req.ip,
-    errorResponseBuilder: (_req: any, ctx: any) => ({ error: 'Too many requests', message: `Retry after ${Math.round(ctx.ttl / 1000)}s`, retryAfter: Math.round(ctx.ttl / 1000) }),
+    errorResponseBuilder: (_req: any, ctx: any) => ({
+        error: 'Too many requests',
+        message: `Retry after ${Math.round(ctx.ttl / 1000)}s`,
+        retryAfter: Math.round(ctx.ttl / 1000),
+    }),
 })
 
 if (env.NODE_ENV !== 'production') {
-    await app.register(FastifySwagger, { openapi: { info: { title: 'VeriSure API', version: '1.0.0' }, servers: [{ url: env.API_BASE_URL }], components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } } }, security: [{ bearerAuth: [] }] } })
+    await app.register(FastifySwagger, {
+        openapi: {
+            info: { title: 'VeriSure API', version: '1.0.0' },
+            servers: [{ url: env.API_BASE_URL }],
+            components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } } },
+            security: [{ bearerAuth: [] }],
+        },
+    })
     await app.register(FastifySwaggerUi, { routePrefix: '/api/docs' })
 }
 
@@ -82,7 +95,8 @@ app.addHook('onSend', async (_req, reply) => {
 app.addHook('onRequest', checkBlockedIp)
 
 // ── ROUTES ────────────────────────────────────────────────────
-app.get('/api/health', async (_req, reply) => reply.status(200).send({ status: 'ok', timestamp: new Date().toISOString(), env: env.NODE_ENV }))
+app.get('/api/health', async (_req, reply) =>
+    reply.status(200).send({ status: 'ok', timestamp: new Date().toISOString(), env: env.NODE_ENV }))
 
 await app.register(authRoutes, { prefix: '/api/v1/auth' })
 await app.register(credentialRoutes, { prefix: '/api/v1/credentials' })
@@ -91,14 +105,18 @@ await app.register(holderRoutes, { prefix: '/api/v1/holders' })
 await app.register(verifierRoutes, { prefix: '/api/v1/verifiers' })
 await app.register(adminRoutes, { prefix: '/api/v1/admin' })
 
-
 // ── ERROR HANDLERS ────────────────────────────────────────────
 app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not found' }))
 
 app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, 'unhandled error')
     if (env.NODE_ENV === 'production') return reply.status(500).send({ error: 'Internal server error' })
-    const e = err as any; return reply.status(e.statusCode ?? 500).send({ error: e.name, message: e.message, stack: env.NODE_ENV === 'development' ? e.stack : undefined })
+    const e = err as any
+    return reply.status(e.statusCode ?? 500).send({
+        error: e.name,
+        message: e.message,
+        stack: env.NODE_ENV === 'development' ? e.stack : undefined,
+    })
 })
 
 // ── STARTUP ───────────────────────────────────────────────────
@@ -107,16 +125,6 @@ async function start() {
         await db.$connect()
         logger.info('db: connected')
 
-        // Run migrations programmatically — ensures tables exist before server starts
-        const { execSync } = await import('child_process')
-        try {
-            execSync('npx prisma migrate deploy', { stdio: 'inherit' })
-            logger.info('db: migrations applied')
-        } catch (err) {
-            logger.warn({ err }, 'db: migration failed — tables may already exist, continuing')
-        }
-
-        // Sync blocked IPs — non-fatal if tables missing
         try {
             await syncBlockedIpsFromDb()
         } catch (err) {
@@ -134,8 +142,16 @@ async function start() {
 // ── SHUTDOWN ──────────────────────────────────────────────────
 async function shutdown(signal: string) {
     logger.info({ signal }, 'shutting down')
-    try { await app.close(); await db.$disconnect(); await redis.quit(); logger.info('shutdown complete'); process.exit(0) }
-    catch (err) { logger.error({ err }, 'shutdown error'); process.exit(1) }
+    try {
+        await app.close()
+        await db.$disconnect()
+        await redis.quit()
+        logger.info('shutdown complete')
+        process.exit(0)
+    } catch (err) {
+        logger.error({ err }, 'shutdown error')
+        process.exit(1)
+    }
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'))

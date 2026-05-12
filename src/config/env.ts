@@ -20,7 +20,9 @@ const schema = z.object({
     JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
     JWT_REFRESH_EXPIRES_IN: z.string().default('30d'),
 
-    API_KEY_ENCRYPTION_KEY: z.string().length(64),
+    API_KEY_ENCRYPTION_KEY: z.string()
+        .length(64, 'API_KEY_ENCRYPTION_KEY must be 64 hex chars (32 bytes)')
+        .regex(/^[0-9a-f]{64}$/, 'API_KEY_ENCRYPTION_KEY must be lowercase hex only'),
 
     POLYGON_RPC_URL: z.string().url(),
     POLYGON_ANCHOR_CONTRACT: z.string(),

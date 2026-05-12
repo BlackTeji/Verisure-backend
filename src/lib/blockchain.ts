@@ -34,18 +34,24 @@ function getInstances() {
 }
 
 // ── NETWORK NAME ──────────────────────────────────────────────
-// Reads POLYGON_NETWORK from env if set, otherwise infers from RPC URL.
-// Add this line to src/config/env.ts inside the schema object,
-// after POLYGON_MIN_BALANCE:
-//   POLYGON_NETWORK: z.string().optional(),
 function networkName(): string {
-    const fromEnv = (env as Record<string, unknown>)['POLYGON_NETWORK'] as string | undefined
-    if (fromEnv) return fromEnv
-    return env.POLYGON_RPC_URL?.includes('amoy') ? 'polygon-amoy' : 'polygon-mainnet'
+    return env.POLYGON_NETWORK ?? (env.POLYGON_RPC_URL?.includes('amoy') ? 'polygon-amoy' : 'polygon-mainnet')
 }
 
 const GAS_BUFFER_PCT = 130n
 const GAS_CAP = 500_000n
+
+// ── EIP-1559 FEE ESTIMATION ───────────────────────────────────
+async function estimateFees(provider: ethers.JsonRpcProvider): Promise<{
+    maxFeePerGas: bigint
+    maxPriorityFeePerGas: bigint
+}> {
+    const feeData = await provider.getFeeData()
+    const base = feeData.gasPrice ?? feeData.maxFeePerGas ?? ethers.parseUnits('50', 'gwei')
+    const tip = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('2', 'gwei')
+    const max = base * 2n + tip
+    return { maxFeePerGas: max, maxPriorityFeePerGas: tip }
+}
 
 // ── WALLET BALANCE ────────────────────────────────────────────
 export async function checkAnchorWalletBalance() {
@@ -79,10 +85,13 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
     }
     const hashBytes = ('0x' + sha256Hash) as `0x${string}`
 
-    const { contract } = getInstances()
+    const { contract, provider } = getInstances()
     const fn = contract.getFunction('anchor')
 
     logger.info({ credentialId, sha256Hash, network: networkName() }, 'blockchain: estimating gas')
+
+    // ── EIP-1559 fees ─────────────────────────────────────────
+    const { maxFeePerGas, maxPriorityFeePerGas } = await estimateFees(provider)
 
     let gasLimit: bigint
     try {
@@ -98,11 +107,11 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
         throw new Error(`Gas estimation failed: ${msg}`)
     }
 
-    logger.info({ credentialId, gasLimit: gasLimit.toString() }, 'blockchain: submitting tx')
+    logger.info({ credentialId, gasLimit: gasLimit.toString(), maxFeePerGas: maxFeePerGas.toString() }, 'blockchain: submitting tx')
 
     let tx: ethers.TransactionResponse
     try {
-        tx = await fn(hashBytes, { gasLimit })
+        tx = await fn(hashBytes, { gasLimit, maxFeePerGas, maxPriorityFeePerGas })
     } catch (err: any) {
         resetInstances()
         throw new Error(`Tx submission failed: ${err?.message ?? err}`)
@@ -151,20 +160,21 @@ async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string):
     const currentBlock = await provider.getBlockNumber()
     const fromBlock = Math.max(0, currentBlock - 100_000)
 
-    // Bracket notation required — contract.filters is an index signature type in ethers v6
-    const filterFn = contract.filters['Anchored']
-    if (typeof filterFn !== 'function') {
-        throw new Error('Anchored filter not found on contract — check ABI')
-    }
-    const filter = (filterFn as (...args: unknown[]) => ethers.ContractEventName)(hashBytes)
-    const events = await contract.queryFilter(filter, fromBlock, currentBlock)
+    const iface = new ethers.Interface(ABI)
+    const filter = iface.encodeFilterTopics('Anchored', [hashBytes])
 
-    if (!events.length) {
+    const logs = await provider.getLogs({
+        address: env.POLYGON_ANCHOR_CONTRACT,
+        topics: filter,
+        fromBlock,
+        toBlock: currentBlock,
+    })
+
+    if (!logs.length) {
         throw new Error(`Hash reported as already anchored but no Anchored event found for ${sha256Hash}`)
     }
 
-    // Guard: events[0] could theoretically be undefined in loose TS configs
-    const event = events[0]
+    const event = logs[0]
     if (!event) throw new Error('Event lookup returned undefined')
 
     const receipt = await provider.getTransactionReceipt(event.transactionHash)
@@ -223,7 +233,7 @@ export async function pingContract(): Promise<{ ok: boolean; network: string; co
         const { provider } = getInstances()
         await provider.getBlockNumber()
         return { ok: true, network: networkName(), contract: env.POLYGON_ANCHOR_CONTRACT ?? '(not set)' }
-    } catch (err) {
+    } catch {
         resetInstances()
         return { ok: false, network: networkName(), contract: env.POLYGON_ANCHOR_CONTRACT ?? '(not set)' }
     }

@@ -3,7 +3,6 @@ import { z } from 'zod'
 import { scrypt, randomBytes } from 'crypto'
 import { promisify } from 'util'
 import { db } from '../../lib/db.js'
-import { logger } from '../../lib/logger.js'
 import { issueAccessToken, issueRefreshToken, verifyRefreshToken, blacklistAccessToken, revokeAllUserTokens } from '../../lib/jwt.js'
 import { sha256, generateSecureToken } from '../../lib/crypto.js'
 import { emailQueue } from '../../lib/queue.js'
@@ -34,7 +33,13 @@ async function verifyPassword(p: string, stored: string): Promise<boolean> {
 
 // ── COOKIE HELPERS ────────────────────────────────────────────
 function setRefreshCookie(reply: any, token: string, expiresAt: Date): void {
-    reply.setCookie(COOKIE, token, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: 'strict', path: '/api/v1/auth/refresh', expires: expiresAt })
+    reply.setCookie(COOKIE, token, {
+        httpOnly: true,
+        secure: env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        path: '/api/v1/auth/refresh',
+        expires: expiresAt,
+    })
 }
 
 function clearRefreshCookie(reply: any): void {
@@ -95,9 +100,14 @@ export default async function authRoutes(app: FastifyInstance) {
 
         const token = generateSecureToken()
         const tokenHash = sha256(token)
-        await db.emailVerificationToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86400000) } })
+        await db.emailVerificationToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86_400_000) } })
 
-        await emailQueue.add('email_verification', { type: 'email_verification', to: user.email, name: d.firstName ?? d.institutionName ?? 'there', data: { verifyUrl: `${env.FRONTEND_URL}/verify-email?token=${token}` } })
+        await emailQueue.add('email_verification', {
+            type: 'email_verification',
+            to: user.email,
+            name: d.firstName ?? d.institutionName ?? 'there',
+            data: { verifyUrl: `${env.FRONTEND_URL}/verify-email?token=${token}` },
+        })
 
         audit({ action: 'USER_SIGNUP', req, targetType: 'user', targetId: user.id, metadata: { role: user.role } })
 
@@ -117,16 +127,31 @@ export default async function authRoutes(app: FastifyInstance) {
         const isValid = user ? await verifyPassword(body.data.password, user.passwordHash) : (await hashPassword('dummy') && false)
 
         if (!user || !isValid) {
-            if (user) await db.user.update({ where: { id: user.id }, data: { failedLoginCount: { increment: 1 }, lockedUntil: user.failedLoginCount >= 9 ? new Date(Date.now() + 900000) : undefined } })
+            if (user) {
+                await db.user.update({
+                    where: { id: user.id },
+                    data: {
+                        failedLoginCount: { increment: 1 },
+                        lockedUntil: user.failedLoginCount >= 9
+                            ? new Date(Date.now() + 900_000)
+                            : undefined,
+                    },
+                })
+            }
             return reply.status(401).send({ error: 'Unauthorized', message: 'Incorrect email or password' })
         }
 
-        if (user.isSuspended) return reply.status(403).send({ error: 'Forbidden', message: 'Account suspended. Contact support.' })
+        if (user.isSuspended) {
+            return reply.status(403).send({ error: 'Forbidden', message: 'Account suspended. Contact support.' })
+        }
         if (user.lockedUntil && user.lockedUntil > new Date()) {
-            return reply.status(429).send({ error: 'Locked', message: `Account locked. Try in ${Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60000)} minutes.` })
+            return reply.status(429).send({ error: 'Locked', message: `Account locked. Try in ${Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60_000)} minutes.` })
         }
 
-        await db.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastLoginIp: req.ip } })
+        await db.user.update({
+            where: { id: user.id },
+            data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastLoginIp: req.ip },
+        })
 
         const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
             issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
@@ -139,7 +164,6 @@ export default async function authRoutes(app: FastifyInstance) {
         return reply.status(200).send({ accessToken, user: { id: user.id, email: user.email, role: user.role } })
     })
 
-    // POST /refresh
     app.post('/refresh', async (req, reply) => {
         const token = (req.cookies as Record<string, string>)[COOKIE]
             ?? (z.object({ refreshToken: z.string() }).safeParse(req.body).success ? (req.body as any).refreshToken : null)
@@ -148,9 +172,15 @@ export default async function authRoutes(app: FastifyInstance) {
 
         try {
             const payload = await verifyRefreshToken(token)
-            const user = await db.user.findUnique({ where: { id: payload.sub as string }, select: { id: true, email: true, role: true, isSuspended: true } })
+            const user = await db.user.findUnique({
+                where: { id: payload.sub as string },
+                select: { id: true, email: true, role: true, isSuspended: true },
+            })
 
-            if (!user || user.isSuspended) { clearRefreshCookie(reply); return reply.status(401).send({ error: 'Unauthorized' }) }
+            if (!user || user.isSuspended) {
+                clearRefreshCookie(reply)
+                return reply.status(401).send({ error: 'Unauthorized' })
+            }
 
             const [accessToken, { token: newRefresh, expiresAt }] = await Promise.all([
                 issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
@@ -177,20 +207,22 @@ export default async function authRoutes(app: FastifyInstance) {
                 const secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
                 const { payload } = await jwtVerify(token, secret)
                 if (payload.jti && payload.exp) await blacklistAccessToken(payload.jti, payload.exp)
-            } catch { /* already expired */ }
+            } catch { /* already expired — no action needed */ }
         }
 
         clearRefreshCookie(reply)
 
         if (req.userId) {
-            await db.refreshToken.updateMany({ where: { userId: req.userId, isRevoked: false }, data: { isRevoked: true, revokedAt: new Date() } })
+            await db.refreshToken.updateMany({
+                where: { userId: req.userId, isRevoked: false },
+                data: { isRevoked: true, revokedAt: new Date() },
+            })
             audit({ action: 'USER_LOGOUT', req, targetType: 'user', targetId: req.userId })
         }
 
         return reply.status(200).send({ message: 'Logged out' })
     })
 
-    // GET /verify-email
     app.get('/verify-email', async (req, reply) => {
         const token = (req.query as Record<string, string>)['token']
         if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
@@ -208,7 +240,6 @@ export default async function authRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Email verified' })
     })
 
-    // POST /forgot-password
     app.post('/forgot-password', async (req, reply) => {
         const body = z.object({ email: z.string().email().toLowerCase() }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error' })
@@ -217,8 +248,13 @@ export default async function authRoutes(app: FastifyInstance) {
         if (user) {
             const token = generateSecureToken()
             const tokenHash = sha256(token)
-            await db.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 3600000) } })
-            await emailQueue.add('password_reset', { type: 'password_reset', to: user.email, name: user.firstName ?? 'there', data: { resetUrl: `${env.FRONTEND_URL}/reset-password?token=${token}` } })
+            await db.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 3_600_000) } })
+            await emailQueue.add('password_reset', {
+                type: 'password_reset',
+                to: user.email,
+                name: user.firstName ?? 'there',
+                data: { resetUrl: `${env.FRONTEND_URL}/reset-password?token=${token}` },
+            })
         }
 
         return reply.status(200).send({ message: 'If an account exists, a reset link has been sent.' })
@@ -242,6 +278,17 @@ export default async function authRoutes(app: FastifyInstance) {
         ])
 
         await revokeAllUserTokens(record.userId)
+
+        const authHeader = req.headers.authorization
+        if (authHeader?.startsWith('Bearer ')) {
+            try {
+                const { jwtVerify } = await import('jose')
+                const secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
+                const { payload } = await jwtVerify(authHeader.slice(7), secret)
+                if (payload.jti && payload.exp) await blacklistAccessToken(payload.jti, payload.exp)
+            } catch { /* token already invalid — fine */ }
+        }
+
         audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: record.userId })
 
         return reply.status(200).send({ message: 'Password reset. Please log in.' })
