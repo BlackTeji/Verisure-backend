@@ -1,19 +1,19 @@
 import { Queue } from 'bullmq'
 import { redis } from './redis.js'
 
-// ── NAMES ─────────────────────────────────────────────────────
 export const QUEUES = {
-    ANCHOR: 'verisure-anchor',
-    EMAIL: 'verisure-email',
-    BULK: 'verisure-bulk',
-    WEBHOOK: 'verisure-webhook',
-    EXPIRY: 'verisure-expiry',
+    ANCHOR: 'vrs-anchor',
+    EMAIL: 'vrs-email',
+    BULK: 'vrs-bulk',
+    WEBHOOK: 'vrs-webhook',
+    EXPIRY_SCHEDULER: 'vrs-expiry-scheduler',
 } as const
 
 // ── PAYLOADS ──────────────────────────────────────────────────
 export interface AnchorJobData { credentialId: string; sha256Hash: string }
 export interface EmailJobData {
-    type: 'credential_issued' | 'email_verification' | 'password_reset' | 'credential_revoked' | 'expiry_reminder' | 'issuer_approved' | 'team_invite'
+    type: 'credential_issued' | 'email_verification' | 'password_reset'
+    | 'credential_revoked' | 'expiry_reminder' | 'issuer_approved' | 'team_invite'
     to: string
     name?: string
     data: Record<string, unknown>
@@ -31,6 +31,11 @@ export const webhookQueue = new Queue<WebhookJobData, any, string>(QUEUES.WEBHOO
 
 // ── HEALTH ────────────────────────────────────────────────────
 export async function getQueueHealth() {
-    const [a, e, b, w] = await Promise.all([anchorQueue.getJobCounts(), emailQueue.getJobCounts(), bulkQueue.getJobCounts(), webhookQueue.getJobCounts()])
+    const [a, e, b, w] = await Promise.all([
+        anchorQueue.getJobCounts(),
+        emailQueue.getJobCounts(),
+        bulkQueue.getJobCounts(),
+        webhookQueue.getJobCounts(),
+    ])
     return { anchor: a, email: e, bulk: b, webhook: w }
 }
