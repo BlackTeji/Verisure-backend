@@ -70,7 +70,7 @@ const signupSchema = z.object({
 
 export default async function authRoutes(app: FastifyInstance) {
 
-    // POST /signup
+    // ── POST /signup ──────────────────────────────────────────
     app.post('/signup', async (req, reply) => {
         const body = signupSchema.safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
@@ -106,7 +106,7 @@ export default async function authRoutes(app: FastifyInstance) {
             type: 'email_verification',
             to: user.email,
             name: d.firstName ?? d.institutionName ?? 'there',
-            data: { verifyUrl: `${env.FRONTEND_URL}/verify-email?token=${token}` },
+            data: { verifyUrl: `${env.FRONTEND_URL}/pages/verify-email.html?token=${token}` },
         })
 
         audit({ action: 'USER_SIGNUP', req, targetType: 'user', targetId: user.id, metadata: { role: user.role } })
@@ -118,7 +118,7 @@ export default async function authRoutes(app: FastifyInstance) {
         return reply.status(201).send({ message, userId: user.id, role: user.role })
     })
 
-    // POST /login
+    // ── POST /login ───────────────────────────────────────────
     app.post('/login', async (req, reply) => {
         const body = z.object({ email: z.string().email().toLowerCase(), password: z.string() }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
@@ -164,6 +164,7 @@ export default async function authRoutes(app: FastifyInstance) {
         return reply.status(200).send({ accessToken, user: { id: user.id, email: user.email, role: user.role } })
     })
 
+    // ── POST /refresh ─────────────────────────────────────────
     app.post('/refresh', async (req, reply) => {
         const token = (req.cookies as Record<string, string>)[COOKIE]
             ?? (z.object({ refreshToken: z.string() }).safeParse(req.body).success ? (req.body as any).refreshToken : null)
@@ -197,7 +198,7 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-    // POST /logout
+    // ── POST /logout ──────────────────────────────────────────
     app.post('/logout', { preHandler: authenticate }, async (req, reply) => {
         const token = req.headers.authorization?.slice(7)
 
@@ -207,7 +208,7 @@ export default async function authRoutes(app: FastifyInstance) {
                 const secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
                 const { payload } = await jwtVerify(token, secret)
                 if (payload.jti && payload.exp) await blacklistAccessToken(payload.jti, payload.exp)
-            } catch { /* already expired — no action needed */ }
+            } catch { }
         }
 
         clearRefreshCookie(reply)
@@ -223,6 +224,7 @@ export default async function authRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Logged out' })
     })
 
+    // ── GET /verify-email ─────────────────────────────────────
     app.get('/verify-email', async (req, reply) => {
         const token = (req.query as Record<string, string>)['token']
         if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
@@ -237,9 +239,45 @@ export default async function authRoutes(app: FastifyInstance) {
             db.user.update({ where: { id: record.userId }, data: { emailVerified: true, emailVerifiedAt: new Date() } }),
         ])
 
-        return reply.status(200).send({ message: 'Email verified' })
+        const user = await db.user.findUnique({ where: { id: record.userId }, select: { role: true } })
+
+        return reply.status(200).send({ message: 'Email verified', role: user?.role ?? null })
     })
 
+    // ── POST /resend-verification ─────────────────────────────
+    app.post('/resend-verification', async (req, reply) => {
+        const body = z.object({ email: z.string().email().toLowerCase() }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error' })
+
+        const user = await db.user.findUnique({
+            where: { email: body.data.email },
+            select: { id: true, email: true, emailVerified: true, firstName: true, role: true },
+        })
+
+        if (user && !user.emailVerified) {
+            await db.emailVerificationToken.updateMany({
+                where: { userId: user.id, usedAt: null },
+                data: { usedAt: new Date() },
+            })
+
+            const token = generateSecureToken()
+            const tokenHash = sha256(token)
+            await db.emailVerificationToken.create({
+                data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86_400_000) },
+            })
+
+            await emailQueue.add('email_verification_resend', {
+                type: 'email_verification',
+                to: user.email,
+                name: user.firstName ?? 'there',
+                data: { verifyUrl: `${env.FRONTEND_URL}/pages/verify-email.html?token=${token}` },
+            })
+        }
+
+        return reply.status(200).send({ message: 'If an unverified account exists for that address, a new link has been sent.' })
+    })
+
+    // ── POST /forgot-password ─────────────────────────────────
     app.post('/forgot-password', async (req, reply) => {
         const body = z.object({ email: z.string().email().toLowerCase() }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error' })
@@ -253,14 +291,28 @@ export default async function authRoutes(app: FastifyInstance) {
                 type: 'password_reset',
                 to: user.email,
                 name: user.firstName ?? 'there',
-                data: { resetUrl: `${env.FRONTEND_URL}/reset-password?token=${token}` },
+                data: { resetUrl: `${env.FRONTEND_URL}/pages/reset-password.html?token=${token}` },
             })
         }
 
         return reply.status(200).send({ message: 'If an account exists, a reset link has been sent.' })
     })
 
-    // POST /reset-password
+    // ── GET /validate-reset-token ─────────────────────────────
+    app.get('/validate-reset-token', async (req, reply) => {
+        const token = (req.query as Record<string, string>)['token']
+        if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
+
+        const record = await db.passwordResetToken.findUnique({ where: { tokenHash: sha256(token) } })
+
+        if (!record || record.usedAt || record.expiresAt < new Date()) {
+            return reply.status(400).send({ error: 'Bad request', message: 'Invalid or expired link' })
+        }
+
+        return reply.status(200).send({ valid: true })
+    })
+
+    // ── POST /reset-password ──────────────────────────────────
     app.post('/reset-password', async (req, reply) => {
         const body = z.object({ token: z.string(), password: z.string().min(8).max(128) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error' })
@@ -286,7 +338,7 @@ export default async function authRoutes(app: FastifyInstance) {
                 const secret = new TextEncoder().encode(env.JWT_ACCESS_SECRET)
                 const { payload } = await jwtVerify(authHeader.slice(7), secret)
                 if (payload.jti && payload.exp) await blacklistAccessToken(payload.jti, payload.exp)
-            } catch { /* token already invalid — fine */ }
+            } catch { }
         }
 
         audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: record.userId })
