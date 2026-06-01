@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { db } from '../../lib/db.js'
 import { generateCredentialId, hashCredential } from '../../lib/crypto.js'
+import { sha256 } from '../../lib/crypto.js'
 import { anchorQueue, emailQueue, webhookQueue } from '../../lib/queue.js'
 import { authenticate, authenticateApiKey, authenticateOptional } from '../../hooks/authenticate.js'
 import { requireIssuer, requireApprovedIssuer, requireScope } from '../../hooks/authorize.js'
@@ -30,31 +31,24 @@ export default async function credentialRoutes(app: FastifyInstance) {
         const issuerId = req.issuerId!
         const id = generateCredentialId()
 
-        // ── Normalise dates to UTC midnight ISO strings ────────
         const issueDateISO = new Date(d.issueDate + (d.issueDate.includes('T') ? '' : 'T00:00:00.000Z')).toISOString()
         const expiryDateISO = d.expiryDate
             ? new Date(d.expiryDate + (d.expiryDate.includes('T') ? '' : 'T00:00:00.000Z')).toISOString()
             : null
 
-        // ── Resolve holder name ───────────────────────────────
         let holderName = d.holderName
         if (!holderName) {
             const holderUser = await db.user.findUnique({
                 where: { email: d.holderEmail },
                 select: { firstName: true, lastName: true, email: true },
             })
-            if (!holderUser) {
-
-                holderName = d.holderEmail
-            } else {
-                holderName = [holderUser.firstName, holderUser.lastName].filter(Boolean).join(' ') || holderUser.email
-            }
+            holderName = holderUser
+                ? ([holderUser.firstName, holderUser.lastName].filter(Boolean).join(' ') || holderUser.email)
+                : d.holderEmail
         }
 
         const sha256Hash = hashCredential({
-            id,
-            issuerId,
-            holderName,
+            id, issuerId, holderName,
             holderEmail: d.holderEmail,
             credentialType: d.credentialType,
             field: d.field ?? null,
@@ -65,9 +59,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
 
         const credential = await db.credential.create({
             data: {
-                id,
-                issuerId,
-                holderName,
+                id, issuerId, holderName,
                 holderEmail: d.holderEmail,
                 credentialType: d.credentialType,
                 field: d.field ?? null,
@@ -92,7 +84,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
                 credentialType: d.credentialType,
                 issuerName: issuer?.institutionName ?? '',
                 credentialId: id,
-                verifyUrl: `${env.FRONTEND_URL}/verify?credential_id=${id}`,
+                verifyUrl: `${env.FRONTEND_URL}/pages/verify.html?credential_id=${id}`,
             },
         })
 
@@ -101,14 +93,13 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(201).send({ ...credential, anchorStatus: 'queued' })
     })
 
-    // ── VERIFY ────────────────────────────────────────────────────
+    // ── VERIFY BY CREDENTIAL ID ───────────────────────────────
     app.get('/verify', { preHandler: authenticateOptional }, async (req, reply) => {
         const query = req.query as Record<string, string>
         const credentialId = query['credential_id']
         if (!credentialId) return reply.status(400).send({ error: 'Bad request', message: 'credential_id required' })
 
-        trackVerificationRate(req).catch(err =>
-            req.log.warn({ err }, 'fraud: trackVerificationRate failed'))
+        trackVerificationRate(req).catch(() => { })
 
         const credential = await db.credential.findUnique({
             where: { id: credentialId },
@@ -116,10 +107,9 @@ export default async function credentialRoutes(app: FastifyInstance) {
         })
 
         if (!credential) {
-
             await db.verificationLog.create({
                 data: {
-                    credentialId: credentialId,
+                    credentialId,
                     verifierId: req.verifierId ?? null,
                     apiKeyId: req.apiKeyId ?? null,
                     method: deriveMethod(req),
@@ -133,7 +123,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
             return reply.status(404).send({ error: 'Not found', message: 'Credential not found' })
         }
 
-        // ── Hash integrity ────────────────────────────────────
         const recomputedHash = hashCredential({
             id: credential.id,
             issuerId: credential.issuerId,
@@ -147,19 +136,16 @@ export default async function credentialRoutes(app: FastifyInstance) {
         })
         const hashValid = recomputedHash === credential.sha256Hash
 
-        // ── On-chain verification ─────────────────────────────
         let onChainValid: boolean | null = null
         if (credential.txHash && hashValid) {
             onChainValid = await verifyHashOnChain(credential.txHash, credential.sha256Hash)
-                .catch(err => { req.log.warn({ err }, 'blockchain: on-chain verify failed — treating as inconclusive'); return null })
+                .catch(() => null)
         }
 
         const authentic = hashValid && (onChainValid !== false)
-
         const issuerApproved = credential.issuer.status === 'APPROVED'
         const isExpired = credential.expiryDate && credential.expiryDate < new Date()
         const effectiveStatus = isExpired && credential.status === 'ACTIVE' ? 'EXPIRED' : credential.status
-
         const method = deriveMethod(req)
 
         await db.verificationLog.create({
@@ -207,9 +193,9 @@ export default async function credentialRoutes(app: FastifyInstance) {
                 status: credential.issuer.status,
             },
             blockchain: {
-                network: credential.blockchainNetwork ?? 'polygon-mainnet',
+                network: credential.txHash ? (credential.blockchainNetwork ?? 'polygon-mainnet') : null,
                 sha256_hash: credential.sha256Hash,
-                tx_hash: credential.txHash,
+                tx_hash: credential.txHash ?? null,
                 anchored_at: credential.anchoredAt?.toISOString() ?? null,
             },
             verified_at: new Date().toISOString(),
@@ -220,7 +206,104 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send(response)
     })
 
-    // ── GET BY ID ──────────────────────────────────────────────────
+    // ── VERIFY BY SHARE TOKEN ─────────────────────────────────
+    app.get('/verify-by-share', async (req, reply) => {
+        const query = req.query as Record<string, string>
+        const shareToken = query['share_token']
+        if (!shareToken) return reply.status(400).send({ error: 'Bad request', message: 'share_token required' })
+
+        trackVerificationRate(req).catch(() => { })
+
+        const tokenHash = sha256(shareToken)
+        const grant = await db.shareGrant.findUnique({
+            where: { tokenHash },
+            include: {
+                credential: {
+                    include: {
+                        issuer: { select: { id: true, institutionName: true, institutionType: true, status: true } },
+                    },
+                },
+            },
+        })
+
+        if (!grant) {
+            return reply.status(404).send({ error: 'Not found', message: 'Share link not found or has been revoked' })
+        }
+
+        if (grant.isRevoked) {
+            return reply.status(410).send({ error: 'Gone', message: 'This share link has been revoked by the credential holder' })
+        }
+
+        if (grant.expiresAt && grant.expiresAt < new Date()) {
+            return reply.status(410).send({ error: 'Gone', message: 'This share link has expired' })
+        }
+
+        await db.shareGrant.update({
+            where: { id: grant.id },
+            data: { lastAccessedAt: new Date(), accessCount: { increment: 1 } },
+        })
+
+        const credential = grant.credential
+
+        const recomputedHash = hashCredential({
+            id: credential.id,
+            issuerId: credential.issuerId,
+            holderName: credential.holderName,
+            holderEmail: credential.holderEmail,
+            credentialType: credential.credentialType,
+            field: credential.field,
+            issueDate: credential.issueDate.toISOString(),
+            expiryDate: credential.expiryDate?.toISOString() ?? null,
+            notes: credential.notes,
+        })
+        const hashValid = recomputedHash === credential.sha256Hash
+
+        let onChainValid: boolean | null = null
+        if (credential.txHash && hashValid) {
+            onChainValid = await verifyHashOnChain(credential.txHash, credential.sha256Hash)
+                .catch(() => null)
+        }
+
+        const authentic = hashValid && (onChainValid !== false)
+        const issuerApproved = credential.issuer.status === 'APPROVED'
+        const isExpired = credential.expiryDate && credential.expiryDate < new Date()
+        const effectiveStatus = isExpired && credential.status === 'ACTIVE' ? 'EXPIRED' : credential.status
+
+        return reply.status(200).send({
+            credential_id: credential.id,
+            credential_type: credential.credentialType,
+            field: credential.field ?? null,
+            notes: credential.notes ?? null,
+            status: effectiveStatus,
+            authentic,
+            hash_valid: hashValid,
+            on_chain_valid: onChainValid,
+            issuer_approved: issuerApproved,
+            holder_name: credential.holderName,
+            holder_email: credential.holderEmail,
+            issue_date: credential.issueDate.toISOString(),
+            expiry_date: credential.expiryDate?.toISOString() ?? null,
+            issuer: {
+                name: credential.issuer.institutionName,
+                type: credential.issuer.institutionType,
+                status: credential.issuer.status,
+            },
+            blockchain: {
+                network: credential.txHash ? (credential.blockchainNetwork ?? 'polygon-mainnet') : null,
+                sha256_hash: credential.sha256Hash,
+                tx_hash: credential.txHash ?? null,
+                anchored_at: credential.anchoredAt?.toISOString() ?? null,
+            },
+            share: {
+                granted_to: grant.recipientEmail || null,
+                expires_at: grant.expiresAt?.toISOString() ?? null,
+                access_count: grant.accessCount + 1,
+            },
+            verified_at: new Date().toISOString(),
+        })
+    })
+
+    // ── GET BY ID ─────────────────────────────────────────────
     app.get('/:id', { preHandler: authenticate }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const cred = await db.credential.findUnique({
@@ -239,7 +322,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send(cred)
     })
 
-    // ── REVOKE ────────────────────────────────────────────────────
+    // ── REVOKE ────────────────────────────────────────────────
     app.patch('/:id/revoke', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const body = z.object({
@@ -288,7 +371,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential revoked', credentialId: id })
     })
 
-    // ── FREEZE ────────────────────────────────────────────────────
+    // ── FREEZE ────────────────────────────────────────────────
     app.patch('/:id/freeze', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const body = z.object({ reason: z.string().min(1).max(500) }).safeParse(req.body)
@@ -305,7 +388,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential frozen', credentialId: id })
     })
 
-    // ── UNFREEZE ──────────────────────────────────────────────────
+    // ── UNFREEZE ──────────────────────────────────────────────
     app.patch('/:id/unfreeze', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const cred = await db.credential.findUnique({ where: { id }, select: { issuerId: true, status: true } })
@@ -319,13 +402,12 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential unfrozen', credentialId: id })
     })
 
-    // ── BATCH VERIFY ──────────────────────────────────────────────
+    // ── BATCH VERIFY ──────────────────────────────────────────
     app.post('/verify/batch', { preHandler: [authenticateApiKey, requireScope('batch')] }, async (req, reply) => {
         const body = z.object({ credential_ids: z.array(z.string()).min(1).max(500) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-        trackVerificationRate(req).catch(err =>
-            req.log.warn({ err }, 'fraud: trackVerificationRate failed'))
+        trackVerificationRate(req).catch(() => { })
 
         const ids = body.data.credential_ids
         const credentials = await db.credential.findMany({
@@ -366,6 +448,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
 // ── HELPERS ───────────────────────────────────────────────────
 function deriveMethod(req: any): 'DASHBOARD' | 'API' | 'QR_SCAN' | 'BULK_CSV' | 'SELF_VERIFY' {
     if (req.apiKeyId) return 'API'
-    if ((req.query as Record<string, string>)['share_token']) return 'QR_SCAN'
+    const query = req.query as Record<string, string>
+    if (query['share_token']) return 'QR_SCAN'
     return 'DASHBOARD'
 }
