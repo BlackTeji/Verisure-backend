@@ -7,6 +7,8 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ═══ ENUMS ════════════════════════════════════════════════════════════════
+
 enum Role {
   HOLDER
   ISSUER
@@ -16,6 +18,7 @@ enum Role {
 
 enum IssuerStatus {
   PENDING
+  UNDER_REVIEW
   APPROVED
   SUSPENDED
   FROZEN
@@ -71,6 +74,15 @@ enum AuditAction {
   BULK_IMPORT_STARTED
   BULK_IMPORT_COMPLETED
   ANCHOR_CONFIRMED
+  ONBOARDING_STEP_1_COMPLETE
+  ONBOARDING_STEP_2_COMPLETE
+  ONBOARDING_SUBMITTED_FOR_REVIEW
+  ONBOARDING_DOCUMENT_UPLOADED
+  ADMIN_DOCUMENT_ACCESSED
+  DOCUMENT_APPROVED
+  DOCUMENT_NEEDS_RESUBMISSION
+  DOCUMENT_REJECTED
+  ISSUER_APPLICATION_REJECTED
 }
 
 enum JobStatus {
@@ -94,28 +106,58 @@ enum AlertStatus {
   DISMISSED
 }
 
+enum DocumentType {
+  CAC_CERTIFICATE
+  NUC_ACCREDITATION
+  PROFESSIONAL_CHARTER
+  LETTER_OF_AUTHORITY
+  CREDENTIAL_SPECIMEN
+  LOGO
+}
+
+enum DocumentReviewStatus {
+  PENDING
+  APPROVED
+  NEEDS_RESUBMISSION
+  REJECTED
+}
+
+enum VirusScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+}
+
+enum MessageDirection {
+  ADMIN_TO_ISSUER
+  ISSUER_TO_ADMIN
+}
+
+// ═══ MODELS ═══════════════════════════════════════════════════════════════
+
 model User {
-  id               String    @id @default(uuid())
-  email            String    @unique
-  emailVerified    Boolean   @default(false)
-  emailVerifiedAt  DateTime?
-  passwordHash     String
-  role             Role
-  firstName        String?
-  lastName         String?
-  phone            String?
-  isActive         Boolean   @default(true)
-  isSuspended      Boolean   @default(false)
-  suspendedAt      DateTime?
-  suspendedReason  String?
-  twoFactorEnabled Boolean   @default(false)
-  twoFactorSecret  String?
-  lastLoginAt      DateTime?
-  lastLoginIp      String?
-  failedLoginCount Int       @default(0)
-  lockedUntil      DateTime?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  id                   String    @id @default(uuid())
+  email                String    @unique
+  emailVerified        Boolean   @default(false)
+  emailVerifiedAt      DateTime?
+  passwordHash         String
+  role                 Role
+  firstName            String?
+  lastName             String?
+  phone                String?
+  isActive             Boolean   @default(true)
+  isSuspended          Boolean   @default(false)
+  suspendedAt          DateTime?
+  suspendedReason      String?
+  twoFactorEnabled     Boolean   @default(false)
+  twoFactorSecret      String?
+  lastLoginAt          DateTime?
+  lastLoginIp          String?
+  failedLoginCount     Int       @default(0)
+  lockedUntil          DateTime?
+  onboardingCompletedAt DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   refreshTokens   RefreshToken[]
   emailTokens     EmailVerificationToken[]
@@ -211,14 +253,19 @@ model IssuerProfile {
   contactTitle       String?
   annualVolume       String?
   status             IssuerStatus @default(PENDING)
+  onboardingStep     Int          @default(0)
+  signatoryNin       String?
+  signatoryWorkEmail String?
+  physicalAddress    Json?
+  websiteUrl         String?
+  logoUrl            String?
+  twoFactorRequired  Boolean      @default(false)
   approvedAt         DateTime?
   approvedById       String?
   suspendedAt        DateTime?
   suspendedReason    String?
   frozenAt           DateTime?
   frozenReason       String?
-  logoUrl            String?
-  websiteUrl         String?
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 
@@ -227,10 +274,50 @@ model IssuerProfile {
   teamMembers      IssuerTeamMember[]
   whitelabelPortal WhitelabelPortal?
   bulkJobs         BulkJob[]
+  documents        IssuerDocument[]
+  messages         OnboardingMessage[]
 
   @@index([status])
   @@index([institutionName])
   @@map("issuer_profiles")
+}
+
+model IssuerDocument {
+  id              String               @id @default(uuid())
+  issuerId        String
+  documentType    DocumentType
+  filename        String
+  storageKey      String
+  mimeType        String
+  fileSizeBytes   Int
+  reviewStatus    DocumentReviewStatus @default(PENDING)
+  reviewedAt      DateTime?
+  reviewedById    String?
+  reviewNote      String?
+  virusScanStatus VirusScanStatus      @default(PENDING)
+  virusScanAt     DateTime?
+  uploadedAt      DateTime             @default(now())
+
+  issuer IssuerProfile @relation(fields: [issuerId], references: [id], onDelete: Cascade)
+
+  @@unique([issuerId, documentType])
+  @@index([issuerId])
+  @@map("issuer_documents")
+}
+
+model OnboardingMessage {
+  id          String           @id @default(uuid())
+  issuerId    String
+  fromAdminId String?
+  direction   MessageDirection
+  body        String           @db.Text
+  readAt      DateTime?
+  createdAt   DateTime         @default(now())
+
+  issuer IssuerProfile @relation(fields: [issuerId], references: [id], onDelete: Cascade)
+
+  @@index([issuerId, readAt])
+  @@map("onboarding_messages")
 }
 
 model IssuerTeamMember {
@@ -282,32 +369,35 @@ model VerifierProfile {
 }
 
 model Credential {
-  id                String           @id @default(dbgenerated("gen_random_uuid()"))
-  issuerId          String
-  holderUserId      String?
-  holderName        String
-  holderEmail       String
-  credentialType    String
-  field             String?
-  notes             String?
-  status            CredentialStatus @default(ACTIVE)
-  issueDate         DateTime
-  expiryDate        DateTime?
-  sha256Hash        String           @unique
-  blockchainNetwork String?
-  txHash            String?
-  blockNumber       BigInt?
-  anchoredAt        DateTime?
-  anchorJobId       String?
-  revokedAt         DateTime?
-  revokedById       String?
-  revocationReason  String?
-  revocationCode    String?
-  frozenAt          DateTime?
-  frozenById        String?
-  frozenReason      String?
-  createdAt         DateTime         @default(now())
-  updatedAt         DateTime         @updatedAt
+  id                    String           @id @default(dbgenerated("gen_random_uuid()"))
+  issuerId              String
+  holderUserId          String?
+  holderName            String
+  holderEmail           String
+  credentialType        String
+  field                 String?
+  notes                 String?
+  status                CredentialStatus @default(ACTIVE)
+  issueDate             DateTime
+  expiryDate            DateTime?
+  sha256Hash            String           @unique
+  blockchainNetwork     String?
+  txHash                String?
+  blockNumber           BigInt?
+  anchoredAt            DateTime?
+  anchorJobId           String?
+  revokedAt             DateTime?
+  revokedById           String?
+  revocationReason      String?
+  revocationCode        String?
+  frozenAt              DateTime?
+  frozenById            String?
+  frozenReason          String?
+  dataSourceDeclared    Boolean          @default(false)
+  dataSourceDeclaredAt  DateTime?
+  dataSourceDeclaredIp  String?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
 
   issuer        IssuerProfile     @relation(fields: [issuerId], references: [id])
   verifications VerificationLog[]
