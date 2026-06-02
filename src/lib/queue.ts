@@ -12,8 +12,9 @@ export const QUEUES = {
 // ── PAYLOADS ──────────────────────────────────────────────────
 export interface AnchorJobData { credentialId: string; sha256Hash: string }
 export interface EmailJobData {
-    type: 'credential_issued' | 'email_verification' | 'password_reset'
-    | 'credential_revoked' | 'expiry_reminder' | 'issuer_approved' | 'team_invite'
+    type: 'email_verification' | 'credential_issued' | 'password_reset'
+        | 'credential_revoked' | 'expiry_reminder' | 'issuer_approved'
+        | 'team_invite' | 'admin_notification'
     to: string
     name?: string
     data: Record<string, unknown>

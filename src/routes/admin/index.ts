@@ -9,16 +9,19 @@ import { blockIp, unblockIp } from '../../hooks/rate-limit.js'
 import { getQueueHealth } from '../../lib/queue.js'
 import { checkAnchorWalletBalance } from '../../lib/blockchain.js'
 import { emailQueue } from '../../lib/queue.js'
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
 export default async function adminRoutes(app: FastifyInstance) {
 
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireAdmin)
 
-    // ── ISSUERS ───────────────────────────────────────────────────
+    // ── ISSUERS — LIST ────────────────────────────────────────────────────────
+
     app.get('/issuers', async (req, reply) => {
         const query = z.object({
-            status: z.enum(['PENDING', 'APPROVED', 'SUSPENDED', 'FROZEN']).optional(),
+            status: z.enum(['PENDING', 'UNDER_REVIEW', 'APPROVED', 'SUSPENDED', 'FROZEN']).optional(),
             page: z.coerce.number().int().min(1).default(1),
             limit: z.coerce.number().int().min(1).max(100).default(25),
             search: z.string().optional(),
@@ -39,7 +42,10 @@ export default async function adminRoutes(app: FastifyInstance) {
         const [issuers, total] = await db.$transaction([
             db.issuerProfile.findMany({
                 where,
-                include: { user: { select: { email: true, createdAt: true, lastLoginAt: true, emailVerified: true } }, _count: { select: { credentials: true } } },
+                include: {
+                    user: { select: { email: true, createdAt: true, lastLoginAt: true, emailVerified: true } },
+                    _count: { select: { credentials: true, documents: true } },
+                },
                 orderBy: { createdAt: 'desc' },
                 skip: (page - 1) * limit,
                 take: limit,
@@ -50,42 +56,230 @@ export default async function adminRoutes(app: FastifyInstance) {
         return reply.status(200).send({ issuers, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
 
+    // ── ISSUERS — DETAIL ──────────────────────────────────────────────────────
+
+    app.get('/issuers/:id', async (req, reply) => {
+        const { id } = req.params as { id: string }
+
+        const profile = await db.issuerProfile.findUnique({
+            where: { id },
+            include: {
+                user: { select: { id: true, email: true, firstName: true, lastName: true, emailVerified: true, createdAt: true, lastLoginAt: true } },
+                documents: {
+                    select: {
+                        id: true, documentType: true, filename: true, mimeType: true,
+                        fileSizeBytes: true, reviewStatus: true, reviewNote: true,
+                        reviewedAt: true, virusScanStatus: true, uploadedAt: true,
+                    },
+                    orderBy: { uploadedAt: 'asc' },
+                },
+                messages: {
+                    select: { id: true, direction: true, body: true, readAt: true, createdAt: true },
+                    orderBy: { createdAt: 'asc' },
+                },
+                _count: { select: { credentials: true } },
+            },
+        })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
+
+        // Never expose the encrypted NIN value
+        const safeProfile = {
+            ...profile,
+            signatoryNin: profile.signatoryNin ? 'XXX-XXXX-XXXXX (encrypted)' : null,
+        }
+
+        return reply.status(200).send({ profile: safeProfile })
+    })
+
+    // ── ISSUERS — DOCUMENT PRESIGNED URL ─────────────────────────────────────
+
+    app.get('/issuers/:id/documents/:docId/url', async (req, reply) => {
+        const { id, docId } = req.params as { id: string; docId: string }
+
+        const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
+        if (!doc) return reply.status(404).send({ error: 'Not found' })
+
+        // 15-minute presigned URL
+        const s3 = new S3Client({ region: process.env['AWS_REGION'] ?? 'us-east-1' })
+        const url = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: process.env['S3_BUCKET'], Key: doc.storageKey }),
+            { expiresIn: 900 },
+        )
+
+        audit({
+            action: 'ADMIN_DOCUMENT_ACCESSED',
+            req,
+            targetType: 'issuer_document',
+            targetId: doc.id,
+            metadata: { issuerId: id, documentType: doc.documentType },
+        })
+
+        return reply.status(200).send({ url, expiresIn: 900 })
+    })
+
+    // ── ISSUERS — DOCUMENT REVIEW ─────────────────────────────────────────────
+
+    app.patch('/issuers/:id/documents/:docId', async (req, reply) => {
+        const { id, docId } = req.params as { id: string; docId: string }
+
+        const body = z.object({
+            reviewStatus: z.enum(['APPROVED', 'NEEDS_RESUBMISSION', 'REJECTED']),
+            reviewNote: z.string().optional(),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const { reviewStatus, reviewNote } = body.data
+
+        if ((reviewStatus === 'NEEDS_RESUBMISSION' || reviewStatus === 'REJECTED') && !reviewNote?.trim()) {
+            return reply.status(400).send({
+                error: 'Validation error',
+                message: 'A review note is required when returning or rejecting a document.',
+            })
+        }
+
+        const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
+        if (!doc) return reply.status(404).send({ error: 'Not found' })
+
+        const updated = await db.issuerDocument.update({
+            where: { id: docId },
+            data: {
+                reviewStatus: reviewStatus as any,
+                reviewNote: reviewNote?.trim() ?? null,
+                reviewedAt: new Date(),
+                reviewedById: req.userId,
+            },
+        })
+
+        audit({
+            action: `DOCUMENT_${reviewStatus}` as any,
+            req,
+            targetType: 'issuer_document',
+            targetId: doc.id,
+            metadata: { issuerId: id, documentType: doc.documentType, reviewNote },
+        })
+
+        // Create an onboarding message if resubmission is needed
+        if (reviewStatus === 'NEEDS_RESUBMISSION') {
+            await db.onboardingMessage.create({
+                data: {
+                    issuerId: id,
+                    fromAdminId: req.userId,
+                    direction: 'ADMIN_TO_ISSUER',
+                    body: `Your ${doc.documentType.replace(/_/g, ' ')} requires resubmission: ${reviewNote}`,
+                },
+            })
+        }
+
+        return reply.status(200).send({ document: updated })
+    })
+
+    // ── ISSUERS — APPROVE ─────────────────────────────────────────────────────
+
     app.patch('/issuers/:id/approve', async (req, reply) => {
         const { id } = req.params as { id: string }
-        const issuer = await db.issuerProfile.findUnique({
-            where: { id },
-            include: { user: { select: { email: true, firstName: true, emailVerified: true } } },
-        })
-        if (!issuer) return reply.status(404).send({ error: 'Not found' })
-        if (issuer.status !== 'PENDING') return reply.status(409).send({ error: 'Conflict', message: 'Not pending' })
 
-        if (!issuer.user.emailVerified) {
+        const profile = await db.issuerProfile.findUnique({
+            where: { id },
+            include: {
+                documents: true,
+                user: { select: { email: true, firstName: true, emailVerified: true } },
+            },
+        })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
+
+        if (profile.status === 'APPROVED') {
+            return reply.status(409).send({ error: 'Conflict', message: 'Issuer is already approved.' })
+        }
+
+        if (!profile.user.emailVerified) {
             return reply.status(422).send({
                 error: 'Unprocessable',
                 message: 'Institution email not verified. Ask the applicant to verify their email before approval.',
             })
         }
 
+        // CAC Certificate must be present and approved
+        const cacDoc = profile.documents.find((d: any) => d.documentType === 'CAC_CERTIFICATE')
+        if (!cacDoc || cacDoc.reviewStatus !== 'APPROVED') {
+            return reply.status(400).send({
+                error: 'Prerequisite failed',
+                message: 'CAC Certificate must be uploaded and approved before approving the issuer.',
+            })
+        }
+
+        // Signatory details must be complete
+        if (!profile.signatoryNin || !profile.signatoryWorkEmail) {
+            return reply.status(400).send({
+                error: 'Prerequisite failed',
+                message: 'Signatory NIN and work email must be on file before approval.',
+            })
+        }
+
         await db.issuerProfile.update({
             where: { id },
-            data: { status: 'APPROVED', approvedAt: new Date(), approvedById: req.userId },
+            data: {
+                status: 'APPROVED',
+                approvedAt: new Date(),
+                approvedById: req.userId,
+                twoFactorRequired: true,
+            },
         })
         await redis.del(keys.issuerStatus(id))
 
         await emailQueue.add('issuer_approved', {
             type: 'issuer_approved',
-            to: issuer.officialEmail,
+            to: profile.officialEmail,
             data: {
-                contactName: `${issuer.contactFirstName} ${issuer.contactLastName}`,
-                institutionName: issuer.institutionName,
+                contactName: `${profile.contactFirstName} ${profile.contactLastName}`,
+                institutionName: profile.institutionName,
                 dashboardUrl: `${process.env['FRONTEND_URL']}/pages/dashboard-issuer.html`,
             },
         })
 
-        audit({ action: 'ISSUER_APPROVED', req, targetType: 'issuer', targetId: id, metadata: { institutionName: issuer.institutionName } })
+        audit({ action: 'ISSUER_APPROVED', req, targetType: 'issuer', targetId: id, metadata: { institutionName: profile.institutionName } })
 
         return reply.status(200).send({ message: 'Issuer approved', issuerId: id })
     })
+
+    // ── ISSUERS — REJECT / RETURN TO PENDING ─────────────────────────────────
+
+    app.post('/issuers/:id/reject', async (req, reply) => {
+        const { id } = req.params as { id: string }
+
+        const body = z.object({ reason: z.string().min(1).max(1000) }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const profile = await db.issuerProfile.findUnique({ where: { id } })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
+
+        await db.$transaction([
+            db.issuerProfile.update({
+                where: { id },
+                data: { status: 'PENDING' },
+            }),
+            db.onboardingMessage.create({
+                data: {
+                    issuerId: id,
+                    fromAdminId: req.userId,
+                    direction: 'ADMIN_TO_ISSUER',
+                    body: body.data.reason.trim(),
+                },
+            }),
+        ])
+
+        audit({
+            action: 'ISSUER_APPLICATION_REJECTED',
+            req,
+            targetType: 'issuer',
+            targetId: id,
+            metadata: { reason: body.data.reason },
+        })
+
+        return reply.status(200).send({ message: 'Application returned to issuer.' })
+    })
+
+    // ── ISSUERS — SUSPEND ─────────────────────────────────────────────────────
 
     app.patch('/issuers/:id/suspend', async (req, reply) => {
         const { id } = req.params as { id: string }
@@ -106,7 +300,31 @@ export default async function adminRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Issuer suspended', issuerId: id })
     })
 
-    // ── USERS ─────────────────────────────────────────────────────
+    // ── ISSUERS — MESSAGE (admin → issuer) ────────────────────────────────────
+
+    app.post('/issuers/:id/message', async (req, reply) => {
+        const { id } = req.params as { id: string }
+
+        const body = z.object({ message: z.string().min(1).max(2000) }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const profile = await db.issuerProfile.findUnique({ where: { id } })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
+
+        const msg = await db.onboardingMessage.create({
+            data: {
+                issuerId: id,
+                fromAdminId: req.userId,
+                direction: 'ADMIN_TO_ISSUER',
+                body: body.data.message.trim(),
+            },
+        })
+
+        return reply.status(201).send({ message: msg })
+    })
+
+    // ── USERS ─────────────────────────────────────────────────────────────────
+
     app.get('/users', async (req, reply) => {
         const query = z.object({
             role: z.enum(['HOLDER', 'ISSUER', 'VERIFIER', 'ADMIN']).optional(),
@@ -154,7 +372,8 @@ export default async function adminRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'User suspended', userId: id })
     })
 
-    // ── AUDIT LOGS ────────────────────────────────────────────────
+    // ── AUDIT LOGS ────────────────────────────────────────────────────────────
+
     app.get('/audit', async (req, reply) => {
         const query = z.object({
             page: z.coerce.number().int().min(1).default(1),
@@ -185,7 +404,8 @@ export default async function adminRoutes(app: FastifyInstance) {
         return reply.status(200).send({ logs, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
 
-    // ── FRAUD ALERTS ──────────────────────────────────────────────
+    // ── FRAUD ALERTS ──────────────────────────────────────────────────────────
+
     app.get('/fraud-alerts', async (req, reply) => {
         const query = z.object({
             status: z.enum(['ACTIVE', 'RESOLVED', 'DISMISSED']).optional(),
@@ -238,17 +458,19 @@ export default async function adminRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: `IP ${ip} unblocked` })
     })
 
-    // ── ANALYTICS ─────────────────────────────────────────────────
+    // ── ANALYTICS ─────────────────────────────────────────────────────────────
+
     app.get('/analytics', async (req, reply) => {
         const [
             totalCredentials, totalVerifications, totalUsers,
-            activeIssuers, credsByStatus, last24h,
+            activeIssuers, pendingReview, credsByStatus, last24h,
             topIssuers, topVerifiers,
         ] = await Promise.all([
             db.credential.count(),
             db.verificationLog.count(),
             db.user.count(),
             db.issuerProfile.count({ where: { status: 'APPROVED' } }),
+            db.issuerProfile.count({ where: { status: 'UNDER_REVIEW' } }),
             db.credential.groupBy({ by: ['status'], _count: true }),
             db.verificationLog.count({ where: { verifiedAt: { gte: new Date(Date.now() - 86_400_000) } } }),
             db.issuerProfile.findMany({ where: { status: 'APPROVED' }, include: { _count: { select: { credentials: true } } }, orderBy: { credentials: { _count: 'desc' } }, take: 10 }),
@@ -256,14 +478,15 @@ export default async function adminRoutes(app: FastifyInstance) {
         ])
 
         return reply.status(200).send({
-            totals: { credentials: totalCredentials, verifications: totalVerifications, users: totalUsers, activeIssuers, last24hVerifications: last24h },
+            totals: { credentials: totalCredentials, verifications: totalVerifications, users: totalUsers, activeIssuers, pendingReview, last24hVerifications: last24h },
             credentialsByStatus: Object.fromEntries(credsByStatus.map(c => [c.status, c._count])),
             topIssuers: topIssuers.map(i => ({ name: i.institutionName, count: i._count.credentials })),
             topVerifiers: topVerifiers.map(v => ({ name: v.organisationName, count: v._count.verifications })),
         })
     })
 
-    // ── HEALTH ────────────────────────────────────────────────────
+    // ── HEALTH ────────────────────────────────────────────────────────────────
+
     app.get('/health', async (req, reply) => {
         const [queueHealth, walletBalance] = await Promise.all([
             getQueueHealth(),
