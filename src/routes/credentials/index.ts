@@ -25,11 +25,27 @@ export default async function credentialRoutes(app: FastifyInstance) {
             expiryDate: z.string().optional(),
         }).safeParse(req.body)
 
-        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+       if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-        const d = body.data
-        const issuerId = req.issuerId!
-        const id = generateCredentialId()
+// ── 2FA enforcement gate ─────────────────────────────
+const issuerProfile = await db.issuerProfile.findUnique({
+    where: { id: req.issuerId! },
+    select: { twoFactorRequired: true },
+})
+const issuerUser = await db.user.findUnique({
+    where: { id: req.userId! },
+    select: { twoFactorEnabled: true },
+})
+if (issuerProfile?.twoFactorRequired && !issuerUser?.twoFactorEnabled) {
+    return reply.status(403).send({
+        error: 'Two-factor authentication required',
+        message: 'Enable two-factor authentication before issuing credentials. Go to Institution Settings → Security.',
+        code: 'TOTP_REQUIRED',
+    })
+}
+const d = body.data
+const issuerId = req.issuerId!
+const id = generateCredentialId()
 
         const issueDateISO = new Date(d.issueDate + (d.issueDate.includes('T') ? '' : 'T00:00:00.000Z')).toISOString()
         const expiryDateISO = d.expiryDate
