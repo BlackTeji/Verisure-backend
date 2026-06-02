@@ -136,28 +136,28 @@ enum MessageDirection {
 // ═══ MODELS ═══════════════════════════════════════════════════════════════
 
 model User {
-  id                   String    @id @default(uuid())
-  email                String    @unique
-  emailVerified        Boolean   @default(false)
-  emailVerifiedAt      DateTime?
-  passwordHash         String
-  role                 Role
-  firstName            String?
-  lastName             String?
-  phone                String?
-  isActive             Boolean   @default(true)
-  isSuspended          Boolean   @default(false)
-  suspendedAt          DateTime?
-  suspendedReason      String?
-  twoFactorEnabled     Boolean   @default(false)
-  twoFactorSecret      String?
-  lastLoginAt          DateTime?
-  lastLoginIp          String?
-  failedLoginCount     Int       @default(0)
-  lockedUntil          DateTime?
+  id                    String    @id @default(uuid())
+  email                 String    @unique
+  emailVerified         Boolean   @default(false)
+  emailVerifiedAt       DateTime?
+  passwordHash          String
+  role                  Role
+  firstName             String?
+  lastName              String?
+  phone                 String?
+  isActive              Boolean   @default(true)
+  isSuspended           Boolean   @default(false)
+  suspendedAt           DateTime?
+  suspendedReason       String?
+  twoFactorEnabled      Boolean   @default(false)
+  twoFactorSecret       String?
+  lastLoginAt           DateTime?
+  lastLoginIp           String?
+  failedLoginCount      Int       @default(0)
+  lockedUntil           DateTime?
   onboardingCompletedAt DateTime?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
   refreshTokens   RefreshToken[]
   emailTokens     EmailVerificationToken[]
@@ -165,12 +165,29 @@ model User {
   issuerProfile   IssuerProfile?
   holderProfile   HolderProfile?
   verifierProfile VerifierProfile?
-  auditLogs       AuditLog[]    @relation("AuditActor")
+  auditLogs       AuditLog[]       @relation("AuditActor")
   sessions        UserSession[]
+  emailAliases    UserEmailAlias[]
 
   @@index([email])
   @@index([role])
   @@map("users")
+}
+
+model UserEmailAlias {
+  id                    String    @id @default(uuid())
+  userId                String
+  email                 String    @unique
+  verifiedAt            DateTime?
+  verificationTokenHash String?
+  verificationExpiresAt DateTime?
+  linkedCredentialCount Int       @default(0)
+  createdAt             DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, verifiedAt])
+  @@map("user_email_aliases")
 }
 
 model RefreshToken {
@@ -269,7 +286,7 @@ model IssuerProfile {
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 
-  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   credentials      Credential[]
   teamMembers      IssuerTeamMember[]
   whitelabelPortal WhitelabelPortal?
@@ -369,35 +386,35 @@ model VerifierProfile {
 }
 
 model Credential {
-  id                    String           @id @default(dbgenerated("gen_random_uuid()"))
-  issuerId              String
-  holderUserId          String?
-  holderName            String
-  holderEmail           String
-  credentialType        String
-  field                 String?
-  notes                 String?
-  status                CredentialStatus @default(ACTIVE)
-  issueDate             DateTime
-  expiryDate            DateTime?
-  sha256Hash            String           @unique
-  blockchainNetwork     String?
-  txHash                String?
-  blockNumber           BigInt?
-  anchoredAt            DateTime?
-  anchorJobId           String?
-  revokedAt             DateTime?
-  revokedById           String?
-  revocationReason      String?
-  revocationCode        String?
-  frozenAt              DateTime?
-  frozenById            String?
-  frozenReason          String?
-  dataSourceDeclared    Boolean          @default(false)
-  dataSourceDeclaredAt  DateTime?
-  dataSourceDeclaredIp  String?
-  createdAt             DateTime         @default(now())
-  updatedAt             DateTime         @updatedAt
+  id                   String           @id @default(dbgenerated("gen_random_uuid()"))
+  issuerId             String
+  holderUserId         String?
+  holderName           String
+  holderEmail          String
+  credentialType       String
+  field                String?
+  notes                String?
+  status               CredentialStatus @default(ACTIVE)
+  issueDate            DateTime
+  expiryDate           DateTime?
+  sha256Hash           String           @unique
+  blockchainNetwork    String?
+  txHash               String?
+  blockNumber          BigInt?
+  anchoredAt           DateTime?
+  anchorJobId          String?
+  revokedAt            DateTime?
+  revokedById          String?
+  revocationReason     String?
+  revocationCode       String?
+  frozenAt             DateTime?
+  frozenById           String?
+  frozenReason         String?
+  dataSourceDeclared   Boolean          @default(false)
+  dataSourceDeclaredAt DateTime?
+  dataSourceDeclaredIp String?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
 
   issuer        IssuerProfile     @relation(fields: [issuerId], references: [id])
   verifications VerificationLog[]
