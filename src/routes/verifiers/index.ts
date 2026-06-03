@@ -6,6 +6,7 @@ import { authenticate } from '../../hooks/authenticate.js'
 import { requireVerifier } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { redis, keys } from '../../lib/redis.js'
+import { webhookQueue } from '../../lib/queue.js'
 
 export default async function verifierRoutes(app: FastifyInstance) {
 
@@ -118,6 +119,51 @@ export default async function verifierRoutes(app: FastifyInstance) {
         if (!w || w.verifierId !== req.verifierId) return reply.status(404).send({ error: 'Not found' })
         await db.webhook.update({ where: { id }, data: { isActive: false } })
         return reply.status(200).send({ message: 'Webhook deleted' })
+    })
+
+    // ── WEBHOOK TEST DELIVERY ──────────────────────────────────────
+    app.post('/me/webhooks/:id/test', async (req, reply) => {
+        const { id } = req.params as { id: string }
+
+        const webhook = await db.webhook.findUnique({
+            where: { id },
+            select: { verifierId: true, isActive: true, url: true },
+        })
+
+        if (!webhook || webhook.verifierId !== req.verifierId) {
+            return reply.status(404).send({ error: 'Not found' })
+        }
+
+        if (!webhook.isActive) {
+            return reply.status(409).send({
+                error: 'Webhook inactive',
+                message: 'This webhook endpoint has been deleted and cannot receive test events.',
+            })
+        }
+
+        const job = await webhookQueue.add(
+            'test',
+            {
+                webhookId: id,
+                event: 'test',
+                payload: {
+                    message: 'This is a test event from VeriSure.',
+                    webhook_id: id,
+                    endpoint_url: webhook.url,
+                    sent_at: new Date().toISOString(),
+                },
+            },
+        
+            { attempts: 1, delay: 0, removeOnComplete: true, removeOnFail: true }
+        )
+
+        audit({ action: 'WEBHOOK_TEST_SENT', req, targetType: 'webhook', targetId: id })
+
+        return reply.status(202).send({
+            queued: true,
+            jobId: job.id,
+            message: 'Test event queued. Check your endpoint logs for the delivery.',
+        })
     })
 
     // ── VERIFICATION HISTORY ──────────────────────────────────────
