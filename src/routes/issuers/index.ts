@@ -330,7 +330,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             targetId: profile.id,
         })
 
-        // Notify admin (fire-and-forget)
         emailQueue.add('onboarding_submitted', {
             type: 'admin_notification',
             to: env.ADMIN_EMAIL ?? process.env['ADMIN_EMAIL'] ?? '',
@@ -423,7 +422,19 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const from = new Date(Date.now() - days * 86400000)
         const issuerId = req.issuerId!
 
-        const [totalIssued, totalVerifications, issuedInPeriod, verificationsInPeriod, byStatus, byType, revoked, topVerifiers, geo, anchorPending] = await Promise.all([
+        // ── CORE METRICS (unchanged) ──────────────────────────────────────────
+        const [
+            totalIssued,
+            totalVerifications,
+            issuedInPeriod,
+            verificationsInPeriod,
+            byStatus,
+            byType,
+            revoked,
+            topVerifiers,
+            geo,
+            anchorPending,
+        ] = await Promise.all([
             db.credential.count({ where: { issuerId } }),
             db.verificationLog.count({ where: { credential: { issuerId } } }),
             db.credential.count({ where: { issuerId, createdAt: { gte: from } } }),
@@ -436,6 +447,62 @@ export default async function issuerRoutes(app: FastifyInstance) {
             db.credential.count({ where: { issuerId, txHash: null, status: { not: 'REVOKED' } } }),
         ])
 
+        // ── REACH METRICS — holder-driven signals ─────────────────────────────
+        // These measure how far credentials travel independent of formal verifier
+        // registrations. An issuer with 0 registered verifiers can still have
+        // thousands of link views from holders sharing directly with employers.
+        const [
+            totalShares,
+            sharesInPeriod,
+            linkOpens,
+            linkOpensInPeriod,
+            unclaimedCredentials,
+            geoReach,
+        ] = await Promise.all([
+            // Total share grants created for credentials issued by this institution
+            db.shareGrant.count({
+                where: { credential: { issuerId } },
+            }),
+            // Share grants created within the current period
+            db.shareGrant.count({
+                where: { credential: { issuerId }, createdAt: { gte: from } },
+            }),
+            // Verification link views: QR scans + share grant accesses
+            // These represent employer/third-party views without a registered account
+            db.verificationLog.count({
+                where: {
+                    credential: { issuerId },
+                    method: { in: ['QR_SCAN', 'SELF_VERIFY'] },
+                },
+            }),
+            // Link opens within the current period
+            db.verificationLog.count({
+                where: {
+                    credential: { issuerId },
+                    method: { in: ['QR_SCAN', 'SELF_VERIFY'] },
+                    verifiedAt: { gte: from },
+                },
+            }),
+            // Credentials that haven't been claimed by a holder yet
+            // (issued to an email with no VeriSure account)
+            db.credential.count({
+                where: { issuerId, holderUserId: null, status: { not: 'REVOKED' } },
+            }),
+            // Geographic reach — distinct countries across ALL verification methods
+            // (not just registered verifiers)
+            db.verificationLog.groupBy({
+                by: ['country'],
+                where: { credential: { issuerId }, country: { not: null } },
+                _count: true,
+                orderBy: { _count: { country: 'desc' } },
+                take: 1,
+            }),
+        ])
+
+        const countriesReached = geo.length  // already queried above as top 10
+        const topCountry = geoReach[0]?.country ?? null
+
+        // ── VERIFIER NAME RESOLUTION (unchanged) ─────────────────────────────
         const verifierIds = topVerifiers.map(v => v.verifierId!).filter(Boolean)
         const verifierProfiles = await db.verifierProfile.findMany({
             where: { id: { in: verifierIds } },
@@ -450,9 +517,23 @@ export default async function issuerRoutes(app: FastifyInstance) {
 
         return reply.status(200).send({
             summary: {
-                totalIssued, totalVerifications, issuedInPeriod, verificationsInPeriod,
+                totalIssued,
+                totalVerifications,
+                issuedInPeriod,
+                verificationsInPeriod,
                 revocationRate: totalIssued > 0 ? ((revoked / totalIssued) * 100).toFixed(2) + '%' : '0%',
                 pendingAnchor: anchorPending,
+            },
+            // Holder-driven reach metrics — visible in the issuer analytics dashboard.
+            // These compound independently of the verifier network size.
+            reach: {
+                totalShares,
+                sharesInPeriod,
+                linkOpens,
+                linkOpensInPeriod,
+                countriesReached,
+                topCountry,
+                unclaimedCredentials,
             },
             byStatus: Object.fromEntries(byStatus.map(s => [s.status, s._count])),
             byType: byType.map(t => ({ type: t.credentialType, count: t._count })),
@@ -671,7 +752,6 @@ function encryptAES(plaintext: string): string {
     return iv.toString('hex') + tag.toString('hex') + encrypted.toString('hex')
 }
 
-// S3-compatible document upload
 async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
     const s3 = new S3Client({ region: process.env['AWS_REGION'] ?? 'us-east-1' })
     const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
