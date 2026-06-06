@@ -139,6 +139,7 @@ export default async function authRoutes(app: FastifyInstance) {
                 where: { email: body.data.email },
                 select: {
                     id: true, email: true, role: true, passwordHash: true,
+                    firstName: true,
                     isSuspended: true, isActive: true, failedLoginCount: true,
                     lockedUntil: true, emailVerified: true,
                 },
@@ -178,6 +179,40 @@ export default async function authRoutes(app: FastifyInstance) {
                 where: { id: user.id },
                 data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastLoginIp: req.ip },
             })
+
+            // ── Session tracking + new device alert ───────────────────
+            const userAgent = req.headers['user-agent']?.slice(0, 500) ?? 'Unknown'
+            const clientIp = req.ip
+
+            const priorSession = await db.userSession.findFirst({
+                where: { userId: user.id, ipAddress: clientIp },
+                select: { id: true },
+            })
+
+            await db.userSession.create({
+                data: { userId: user.id, ipAddress: clientIp, userAgent, isActive: true },
+            })
+
+            if (!priorSession) {
+                const loginTime = new Date().toLocaleString('en-NG', {
+                    timeZone: 'Africa/Lagos',
+                    dateStyle: 'medium',
+                    timeStyle: 'short',
+                })
+                emailQueue.add('new_device_alert', {
+                    type: 'new_device_alert',
+                    to: user.email,
+                    data: {
+                        name: user.firstName ?? 'there',
+                        email: user.email,
+                        ipAddress: clientIp,
+                        userAgent: userAgent.slice(0, 120),
+                        loginTime,
+                        accountUrl: `${env.FRONTEND_URL}/pages/login.html`,
+                    },
+                }).catch(() => { /* alert failure must never break login */ })
+            }
+            // ── End session tracking ──────────────────────────────────
 
             const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
                 issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
@@ -251,6 +286,11 @@ export default async function authRoutes(app: FastifyInstance) {
                     where: { userId: req.userId, isRevoked: false },
                     data: { isRevoked: true, revokedAt: new Date() },
                 })
+                // Mark current session as inactive
+                await db.userSession.updateMany({
+                    where: { userId: req.userId, ipAddress: req.ip, isActive: true },
+                    data: { isActive: false, revokedAt: new Date() },
+                }).catch(() => { })
                 audit({ action: 'USER_LOGOUT', req, targetType: 'user', targetId: req.userId })
             }
 
@@ -397,6 +437,12 @@ export default async function authRoutes(app: FastifyInstance) {
             ])
 
             await revokeAllUserTokens(record.userId)
+
+            // Revoke all active sessions on password reset
+            await db.userSession.updateMany({
+                where: { userId: record.userId, isActive: true },
+                data: { isActive: false, revokedAt: new Date() },
+            }).catch(() => { })
 
             const authHeader = req.headers.authorization
             if (authHeader?.startsWith('Bearer ')) {
