@@ -35,7 +35,6 @@ const schema = z.object({
     SMTP_SECURE: z.string().transform(s => s === 'true'),
     SMTP_USER: z.string(),
     SMTP_PASSWORD: z.string(),
-    EMAIL_FROM: z.string(),
     EMAIL_REPLY_TO: z.string().optional(),
 
     RATE_LIMIT_PUBLIC_MAX: z.coerce.number().default(20),
@@ -54,6 +53,10 @@ const schema = z.object({
 
     ADMIN_EMAIL: z.string().email().optional(),
     ADMIN_INITIAL_PASSWORD: z.string().optional(),
+
+    RESEND_API_KEY: z.string().min(1),
+    EMAIL_FROM: z.string().email().or(z.string().regex(/^.+<.+@.+>$/)),
+
 })
 
 const parsed = schema.safeParse(process.env)

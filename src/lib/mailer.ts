@@ -1,28 +1,33 @@
-import nodemailer, { type Transporter } from 'nodemailer'
+import { Resend } from 'resend'
 import { env } from '../config/env.js'
 import { logger } from './logger.js'
 
-let _transport: Transporter | null = null
+const resend = new Resend(env.RESEND_API_KEY)
 
-function transport(): Transporter {
-    if (!_transport) {
-        _transport = nodemailer.createTransport({
-            host: env.SMTP_HOST, port: env.SMTP_PORT, secure: env.SMTP_SECURE,
-            auth: { user: env.SMTP_USER, pass: env.SMTP_PASSWORD },
-            pool: true, maxConnections: 5,
-        })
-    }
-    return _transport
+// ── SEND ──────────────────────────────────────────────────────
+interface SendEmailOptions {
+    to: string
+    subject: string
+    html: string
+    text: string
 }
 
-export async function sendEmail(opts: { to: string; subject: string; html: string; text: string }): Promise<void> {
-    try {
-        await transport().sendMail({ from: env.EMAIL_FROM, replyTo: env.EMAIL_REPLY_TO, ...opts })
-        logger.info({ to: opts.to, subject: opts.subject }, 'email: sent')
-    } catch (err) {
-        logger.error({ to: opts.to, subject: opts.subject, err }, 'email: failed')
-        throw err
+export async function sendEmail({ to, subject, html, text }: SendEmailOptions) {
+    const { data, error } = await resend.emails.send({
+        from: env.EMAIL_FROM,
+        to,
+        subject,
+        html,
+        text,
+    })
+
+    if (error) {
+        logger.error({ error, to, subject }, 'mailer: resend error')
+        throw new Error(`Email send failed: ${error.message}`)
     }
+
+    logger.info({ id: data?.id, to, subject }, 'mailer: sent')
+    return data
 }
 
 // ── TEMPLATES ─────────────────────────────────────────────────
