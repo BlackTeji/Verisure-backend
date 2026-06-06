@@ -23,29 +23,30 @@ export default async function credentialRoutes(app: FastifyInstance) {
             notes: z.string().max(1000).optional(),
             issueDate: z.string(),
             expiryDate: z.string().optional(),
+            dataSourceDeclared: z.boolean().optional(),
         }).safeParse(req.body)
 
-       if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-// ── 2FA enforcement gate ─────────────────────────────
-const issuerProfile = await db.issuerProfile.findUnique({
-    where: { id: req.issuerId! },
-    select: { twoFactorRequired: true },
-})
-const issuerUser = await db.user.findUnique({
-    where: { id: req.userId! },
-    select: { twoFactorEnabled: true },
-})
-if (issuerProfile?.twoFactorRequired && !issuerUser?.twoFactorEnabled) {
-    return reply.status(403).send({
-        error: 'Two-factor authentication required',
-        message: 'Enable two-factor authentication before issuing credentials. Go to Institution Settings → Security.',
-        code: 'TOTP_REQUIRED',
-    })
-}
-const d = body.data
-const issuerId = req.issuerId!
-const id = generateCredentialId()
+        // ── 2FA enforcement gate ─────────────────────────────
+        const issuerProfile = await db.issuerProfile.findUnique({
+            where: { id: req.issuerId! },
+            select: { twoFactorRequired: true },
+        })
+        const issuerUser = await db.user.findUnique({
+            where: { id: req.userId! },
+            select: { twoFactorEnabled: true },
+        })
+        if (issuerProfile?.twoFactorRequired && !issuerUser?.twoFactorEnabled) {
+            return reply.status(403).send({
+                error: 'Two-factor authentication required',
+                message: 'Enable two-factor authentication before issuing credentials. Go to Institution Settings → Security.',
+                code: 'TOTP_REQUIRED',
+            })
+        }
+        const d = body.data
+        const issuerId = req.issuerId!
+        const id = generateCredentialId()
 
         const issueDateISO = new Date(d.issueDate + (d.issueDate.includes('T') ? '' : 'T00:00:00.000Z')).toISOString()
         const expiryDateISO = d.expiryDate
@@ -84,6 +85,9 @@ const id = generateCredentialId()
                 expiryDate: expiryDateISO ? new Date(expiryDateISO) : null,
                 sha256Hash,
                 status: 'ACTIVE',
+                dataSourceDeclared: (req.body as any).dataSourceDeclared === true,
+                dataSourceDeclaredAt: (req.body as any).dataSourceDeclared === true ? new Date() : null,
+                dataSourceDeclaredIp: (req.body as any).dataSourceDeclared === true ? req.ip : null,
             },
             select: { id: true, credentialType: true, holderName: true, holderEmail: true, issueDate: true, expiryDate: true, sha256Hash: true, status: true },
         })
