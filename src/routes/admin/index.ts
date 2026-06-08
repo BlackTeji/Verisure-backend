@@ -101,7 +101,11 @@ export default async function adminRoutes(app: FastifyInstance) {
         if (!doc) return reply.status(404).send({ error: 'Not found' })
 
         // 15-minute presigned URL
-        const s3 = new S3Client({ region: env.S3_REGION })
+        const s3 = new S3Client({
+            region: env.S3_REGION ?? 'auto',
+            endpoint: env.S3_ENDPOINT,
+            forcePathStyle: false,
+        })
         const url = await getSignedUrl(
             s3,
             new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: doc.storageKey }),

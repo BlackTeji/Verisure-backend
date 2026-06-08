@@ -811,7 +811,11 @@ function encryptAES(plaintext: string): string {
 }
 
 async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
-    const s3 = new S3Client({ region: env.S3_REGION })
+    const s3 = new S3Client({
+        region: env.S3_REGION ?? 'auto',
+        endpoint: env.S3_ENDPOINT,
+        forcePathStyle: false,
+    })
     const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
     await s3.send(new PutObjectCommand({
         Bucket: env.S3_BUCKET,
