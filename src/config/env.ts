@@ -24,6 +24,13 @@ const schema = z.object({
         .length(64, 'API_KEY_ENCRYPTION_KEY must be 64 hex chars (32 bytes)')
         .regex(/^[0-9a-f]{64}$/, 'API_KEY_ENCRYPTION_KEY must be lowercase hex only'),
 
+    // Used for NIN and other sensitive field encryption (AES-256-GCM).
+    // Must be 64 lowercase hex chars (32 bytes). Can be the same value as
+    // API_KEY_ENCRYPTION_KEY or a separate key — separate is preferred.
+    ENCRYPTION_KEY: z.string()
+        .length(64, 'ENCRYPTION_KEY must be 64 hex chars (32 bytes)')
+        .regex(/^[0-9a-f]{64}$/, 'ENCRYPTION_KEY must be lowercase hex only'),
+
     POLYGON_RPC_URL: z.string().url(),
     POLYGON_ANCHOR_CONTRACT: z.string(),
     POLYGON_PRIVATE_KEY: z.string(),
@@ -36,6 +43,13 @@ const schema = z.object({
     SMTP_USER: z.string(),
     SMTP_PASSWORD: z.string(),
     EMAIL_REPLY_TO: z.string().optional(),
+
+    // S3-compatible object storage — required for document upload and presigned URLs.
+    S3_BUCKET: z.string().min(1).optional(),
+    S3_REGION: z.string().min(1).optional(),
+    S3_ENDPOINT: z.string().url().optional(),
+    S3_ACCESS_KEY_ID: z.string().min(1).optional(),
+    S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
 
     RATE_LIMIT_PUBLIC_MAX: z.coerce.number().default(20),
     RATE_LIMIT_PUBLIC_WINDOW_MS: z.coerce.number().default(60000),
@@ -56,7 +70,6 @@ const schema = z.object({
 
     RESEND_API_KEY: z.string().min(1),
     EMAIL_FROM: z.string().email().or(z.string().regex(/^.+<.+@.+>$/)),
-
 })
 
 const parsed = schema.safeParse(process.env)

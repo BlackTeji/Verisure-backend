@@ -4,6 +4,7 @@ import { logger } from '../lib/logger.js'
 import { db } from '../lib/db.js'
 import { anchorQueue, emailQueue, QUEUES } from '../lib/queue.js'
 import { generateCredentialId, hashCredential } from '../lib/crypto.js'
+import { env } from '../config/env.js'
 import type { BulkJobData } from '../lib/queue.js'
 
 logger.info('bulk-worker: starting')
@@ -22,6 +23,7 @@ const worker = new Worker<BulkJobData>(
 )
 
 // ── ISSUANCE ──────────────────────────────────────────────────
+
 async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: string) {
     let rows: any[]
     try { rows = JSON.parse(fileKey) } catch {
@@ -71,6 +73,7 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
                         status: 'ACTIVE',
                     },
                 })
+
                 await anchorQueue.add('anchor-bulk', { credentialId: id, sha256Hash }, { delay: idx * 200 })
 
                 await emailQueue.add(`bulk-notify-${id}`, {
@@ -81,7 +84,7 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
                         credentialType: String(row.credentialType).trim(),
                         issuerName: issuer?.institutionName ?? '',
                         credentialId: id,
-                        verifyUrl: `${process.env['FRONTEND_URL']}/verify?credential_id=${id}`,
+                        verifyUrl: `${env.FRONTEND_URL}/pages/verify.html?credential_id=${id}`,
                     },
                 })
 
@@ -106,13 +109,23 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
     })
     await job.updateProgress(100)
 
-    // Notify the issuer (single email, not per-row).
-    const issuerUser = await db.issuerProfile.findUnique({ where: { id: issuerId }, include: { user: { select: { email: true } } } })
+    const issuerUser = await db.issuerProfile.findUnique({
+        where: { id: issuerId },
+        include: { user: { select: { email: true } } },
+    })
     if (issuerUser?.user.email) {
         await emailQueue.add('bulk-complete', {
-            type: 'email_verification',
+            type: 'bulk_complete',
             to: issuerUser.user.email,
-            data: { jobId, totalRows: rows.length, succeeded, failed, status: finalStatus },
+            data: {
+                institutionName: issuer?.institutionName ?? '',
+                jobId,
+                totalRows: rows.length,
+                succeeded,
+                failed,
+                status: finalStatus,
+                dashboardUrl: `${env.FRONTEND_URL}/pages/dashboard-issuer.html`,
+            },
         })
     }
 
@@ -120,6 +133,7 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
 }
 
 // ── VERIFICATION ──────────────────────────────────────────────
+
 async function runVerification(job: any, jobId: string, fileKey: string, verifierId: string) {
     let rows: any[]
     try { rows = JSON.parse(fileKey) } catch {
@@ -136,7 +150,10 @@ async function runVerification(job: any, jobId: string, fileKey: string, verifie
         const batch = rows.slice(i, i + BATCH)
         const batchIds = batch.map((r: any) => String(r.credential_id ?? r.id ?? '')).filter(Boolean)
 
-        const creds = await db.credential.findMany({ where: { id: { in: batchIds } }, include: { issuer: { select: { institutionName: true, status: true } } } })
+        const creds = await db.credential.findMany({
+            where: { id: { in: batchIds } },
+            include: { issuer: { select: { institutionName: true, status: true } } },
+        })
         const credMap = new Map(creds.map(c => [c.id, c]))
 
         for (const [bi, row] of batch.entries()) {
@@ -159,7 +176,14 @@ async function runVerification(job: any, jobId: string, fileKey: string, verifie
                 continue
             }
 
-            const recomputed = hashCredential({ id: c.id, issuerId: c.issuerId, holderName: c.holderName, holderEmail: c.holderEmail, credentialType: c.credentialType, field: c.field, issueDate: c.issueDate.toISOString(), expiryDate: c.expiryDate?.toISOString() ?? null, notes: c.notes })
+            const recomputed = hashCredential({
+                id: c.id, issuerId: c.issuerId,
+                holderName: c.holderName, holderEmail: c.holderEmail,
+                credentialType: c.credentialType, field: c.field,
+                issueDate: c.issueDate.toISOString(),
+                expiryDate: c.expiryDate?.toISOString() ?? null,
+                notes: c.notes,
+            })
             const hashValid = recomputed === c.sha256Hash
             const issuerApproved = c.issuer.status === 'APPROVED'
             const isExpired = c.expiryDate && c.expiryDate < new Date()
@@ -194,10 +218,15 @@ async function runVerification(job: any, jobId: string, fileKey: string, verifie
     logger.info({ jobId, succeeded, failed, finalStatus }, 'bulk-worker: verification done')
 }
 
+// ── EVENTS ────────────────────────────────────────────────────
+
 worker.on('failed', async (job, err) => {
     logger.error({ jobId: job?.id, err }, 'bulk-worker: job failed')
     if (job?.data.jobId) {
-        await db.bulkJob.update({ where: { id: job.data.jobId }, data: { status: 'FAILED', completedAt: new Date(), errorLog: { error: err.message } } }).catch(() => { })
+        await db.bulkJob.update({
+            where: { id: job.data.jobId },
+            data: { status: 'FAILED', completedAt: new Date(), errorLog: { error: err.message } },
+        }).catch(() => { })
     }
 })
 

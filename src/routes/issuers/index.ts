@@ -390,7 +390,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
 
         emailQueue.add('onboarding_submitted', {
             type: 'admin_notification',
-            to: env.ADMIN_EMAIL ?? process.env['ADMIN_EMAIL'] ?? '',
+            to: env.ADMIN_EMAIL ?? '',
             data: {
                 institutionName: profile.institutionName,
                 issuerId: profile.id,
@@ -801,7 +801,7 @@ async function buildDailySeries(issuerId: string, from: Date, type: 'issued' | '
 }
 
 function encryptAES(plaintext: string): string {
-    const key = Buffer.from(process.env['ENCRYPTION_KEY'] ?? '', 'hex')
+    const key = Buffer.from(env.ENCRYPTION_KEY, 'hex')
     if (key.length !== 32) throw new Error('ENCRYPTION_KEY must be 32 bytes (64 hex chars)')
     const iv = randomBytes(12)
     const cipher = createCipheriv('aes-256-gcm', key, iv)
@@ -811,10 +811,10 @@ function encryptAES(plaintext: string): string {
 }
 
 async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
-    const s3 = new S3Client({ region: process.env['AWS_REGION'] ?? 'us-east-1' })
+    const s3 = new S3Client({ region: env.S3_REGION })
     const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
     await s3.send(new PutObjectCommand({
-        Bucket: process.env['S3_BUCKET'],
+        Bucket: env.S3_BUCKET,
         Key: key,
         Body: fileBuffer,
         ContentType: mimeType,

@@ -11,6 +11,7 @@ import { checkAnchorWalletBalance } from '../../lib/blockchain.js'
 import { emailQueue } from '../../lib/queue.js'
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { env } from '../../config/env.js'
 
 export default async function adminRoutes(app: FastifyInstance) {
 
@@ -100,10 +101,10 @@ export default async function adminRoutes(app: FastifyInstance) {
         if (!doc) return reply.status(404).send({ error: 'Not found' })
 
         // 15-minute presigned URL
-        const s3 = new S3Client({ region: process.env['AWS_REGION'] ?? 'us-east-1' })
+        const s3 = new S3Client({ region: env.S3_REGION })
         const url = await getSignedUrl(
             s3,
-            new GetObjectCommand({ Bucket: process.env['S3_BUCKET'], Key: doc.storageKey }),
+            new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: doc.storageKey }),
             { expiresIn: 900 },
         )
 
@@ -233,7 +234,7 @@ export default async function adminRoutes(app: FastifyInstance) {
             data: {
                 contactName: `${profile.contactFirstName} ${profile.contactLastName}`,
                 institutionName: profile.institutionName,
-                dashboardUrl: `${process.env['FRONTEND_URL']}/pages/dashboard-issuer.html`,
+                dashboardUrl: `${env.FRONTEND_URL}/pages/dashboard-issuer.html`,
             },
         })
 

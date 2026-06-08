@@ -5,6 +5,7 @@ import { logger } from './logger.js'
 const resend = new Resend(env.RESEND_API_KEY)
 
 // ── SEND ──────────────────────────────────────────────────────
+
 interface SendEmailOptions {
     to: string
     subject: string
@@ -30,6 +31,7 @@ export async function sendEmail({ to, subject, html, text }: SendEmailOptions): 
 }
 
 // ── BASE TEMPLATE ─────────────────────────────────────────────
+
 const wrap = (body: string) => `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -51,6 +53,15 @@ const wrap = (body: string) => `<!DOCTYPE html>
   .foot a{color:#D94010;text-decoration:none}
   .alert-box{background:#FFF8F6;border:1px solid #F5C4B8;border-radius:8px;padding:16px;margin:16px 0}
   .alert-box p{margin:0;color:#7A3020}
+  .stat-row{display:flex;gap:16px;margin:20px 0}
+  .stat-box{flex:1;background:#F5F3EE;border:1px solid #E4E0D8;border-radius:8px;padding:16px;text-align:center}
+  .stat-box .n{font-size:26px;font-weight:600;color:#0E0E0C;line-height:1}
+  .stat-box .l{font-size:11px;color:#A8A49C;margin-top:4px;text-transform:uppercase;letter-spacing:0.06em}
+  .stat-box.fail .n{color:#B33020}
+  .tag{display:inline-block;border-radius:4px;font-size:12px;font-weight:600;padding:2px 10px;letter-spacing:0.04em}
+  .tag-complete{background:#EBF3EE;color:#1E4D38;border:1px solid #B8D4C6}
+  .tag-partial{background:#FBF5E0;color:#5C4A00;border:1px solid #E0CC80}
+  .tag-failed{background:#FAF0F0;color:#6B1010;border:1px solid #E8BABA}
 </style>
 </head>
 <body>
@@ -69,6 +80,7 @@ const wrap = (body: string) => `<!DOCTYPE html>
 </html>`
 
 // ── TEMPLATES ─────────────────────────────────────────────────
+
 export const templates = {
 
     credentialIssued: (d: {
@@ -166,7 +178,6 @@ export const templates = {
         text: `${d.institutionName} is approved on VeriSure. Go to your dashboard: ${d.dashboardUrl}\n\nEnable two-factor authentication before issuing.`,
     }),
 
-    // ── New: admin notification when issuer submits for review ─
     adminNotification: (d: {
         institutionName: string
         issuerId: string
@@ -183,7 +194,6 @@ export const templates = {
         text: `New issuer application from ${d.institutionName} (ID: ${d.issuerId}).\n\nReview at: ${d.dashboardUrl}\n\nTarget SLA: 2 business days.`,
     }),
 
-    // ── New: new device / new IP login alert ──────────────────
     newDeviceAlert: (d: {
         name: string
         email: string
@@ -208,4 +218,46 @@ export const templates = {
         `),
         text: `New sign-in to your VeriSure account.\n\nTime: ${d.loginTime}\nIP: ${d.ipAddress}\nDevice: ${d.userAgent}\n\nIf this wasn't you, change your password immediately: ${d.accountUrl}`,
     }),
+
+    bulkComplete: (d: {
+        institutionName: string
+        jobId: string
+        totalRows: number
+        succeeded: number
+        failed: number
+        status: string
+        dashboardUrl: string
+    }) => {
+        const tag = d.status === 'COMPLETED'
+            ? `<span class="tag tag-complete">COMPLETED</span>`
+            : d.status === 'PARTIAL'
+                ? `<span class="tag tag-partial">PARTIAL</span>`
+                : `<span class="tag tag-failed">FAILED</span>`
+
+        return {
+            subject: `Bulk issuance ${d.status.toLowerCase()}: ${d.succeeded.toLocaleString()} of ${d.totalRows.toLocaleString()} credentials issued`,
+            html: wrap(`
+                <h1>Bulk issuance complete.</h1>
+                <p>Your bulk issuance job for <strong>${d.institutionName}</strong> has finished. Status: ${tag}</p>
+                <div class="stat-row">
+                    <div class="stat-box">
+                        <div class="n">${d.totalRows.toLocaleString()}</div>
+                        <div class="l">Total rows</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="n">${d.succeeded.toLocaleString()}</div>
+                        <div class="l">Issued</div>
+                    </div>
+                    <div class="stat-box${d.failed > 0 ? ' fail' : ''}">
+                        <div class="n">${d.failed.toLocaleString()}</div>
+                        <div class="l">Failed</div>
+                    </div>
+                </div>
+                ${d.failed > 0 ? `<p style="font-size:13px">Rows that failed validation were skipped. Download the job results from your dashboard to review individual errors.</p>` : ''}
+                <p style="font-size:12px;color:#A8A49C">Job ID: ${d.jobId}</p>
+                <a href="${d.dashboardUrl}" class="btn">View job results →</a>
+            `),
+            text: `Bulk issuance ${d.status.toLowerCase()} for ${d.institutionName}.\n\nTotal: ${d.totalRows} · Issued: ${d.succeeded} · Failed: ${d.failed}\n\nJob ID: ${d.jobId}\n\nView results: ${d.dashboardUrl}`,
+        }
+    },
 }

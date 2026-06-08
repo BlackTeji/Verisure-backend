@@ -19,41 +19,33 @@ const worker = new Worker<EmailJobData>(
             case 'credential_issued':
                 email = templates.credentialIssued(data as any)
                 break
-
             case 'email_verification':
                 email = templates.emailVerification({ name: name ?? 'there', verifyUrl: data['verifyUrl'] as string })
                 break
-
             case 'password_reset':
                 email = templates.passwordReset({ name: name ?? 'there', resetUrl: data['resetUrl'] as string })
                 break
-
             case 'credential_revoked':
                 email = templates.credentialRevoked(data as any)
                 break
-
             case 'expiry_reminder':
                 email = templates.expiryReminder(data as any)
                 break
-
             case 'issuer_approved':
                 email = templates.issuerApproved(data as any)
                 break
-
             case 'team_invite':
                 email = templates.emailVerification({ name: name ?? 'there', verifyUrl: data['verifyUrl'] as string })
                 break
-
             case 'admin_notification':
-                // Admin alert: new issuer application submitted for review
                 email = templates.adminNotification(data as any)
                 break
-
             case 'new_device_alert':
-                // Security alert: login from unrecognised IP
                 email = templates.newDeviceAlert(data as any)
                 break
-
+            case 'bulk_complete':
+                email = templates.bulkComplete(data as any)
+                break
             default:
                 logger.warn({ type }, 'email-worker: unknown email type — skipping')
                 return

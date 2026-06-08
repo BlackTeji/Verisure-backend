@@ -10,6 +10,7 @@ export const QUEUES = {
 } as const
 
 // ── PAYLOADS ──────────────────────────────────────────────────
+
 export interface AnchorJobData {
     credentialId: string
     sha256Hash: string
@@ -26,6 +27,7 @@ export interface EmailJobData {
     | 'team_invite'
     | 'admin_notification'
     | 'new_device_alert'
+    | 'bulk_complete'
     to: string
     name?: string
     data: Record<string, unknown>
@@ -47,6 +49,7 @@ export interface WebhookJobData {
 }
 
 // ── QUEUES ────────────────────────────────────────────────────
+
 const conn = redis
 
 export const anchorQueue = new Queue<AnchorJobData, any, string>(QUEUES.ANCHOR, {
@@ -89,6 +92,7 @@ export const webhookQueue = new Queue<WebhookJobData, any, string>(QUEUES.WEBHOO
 })
 
 // ── HEALTH ────────────────────────────────────────────────────
+
 export async function getQueueHealth() {
     const [a, e, b, w] = await Promise.all([
         anchorQueue.getJobCounts(),
