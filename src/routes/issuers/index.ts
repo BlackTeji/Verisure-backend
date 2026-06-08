@@ -13,72 +13,62 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
-    app.get(
-        '/public',
-        {
-            schema: {
-                querystring: z.object({
-                    page: z.coerce.number().int().positive().default(1),
-                    limit: z.coerce.number().int().min(1).max(100).default(48),
-                    search: z.string().max(120).optional(),
-                    type: z.string().max(80).optional(),
-                }),
-            },
-        },
-        async (request, reply) => {
-            const { page, limit, search, type } = request.query as {
-                page: number;
-                limit: number;
-                search?: string;
-                type?: string;
+    app.get('/public', async (request, reply) => {
+        const query = z.object({
+            page: z.coerce.number().int().positive().default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(48),
+            search: z.string().max(120).optional(),
+            type: z.string().max(80).optional(),
+        }).safeParse(request.query)
+        if (!query.success) return reply.status(400).send({ error: 'Validation error' })
+        const { page, limit, search, type } = query.data
+
+        const skip = (page - 1) * limit;
+
+        const where: any = { status: 'APPROVED' };
+
+        if (search?.trim()) {
+            where.institutionName = {
+                contains: search.trim(),
+                mode: 'insensitive',
             };
-
-            const skip = (page - 1) * limit;
-
-            const where: any = { status: 'APPROVED' };
-
-            if (search?.trim()) {
-                where.institutionName = {
-                    contains: search.trim(),
-                    mode: 'insensitive',
-                };
-            }
-
-            if (type?.trim()) {
-                where.institutionType = type.trim();
-            }
-
-            const [issuers, total] = await Promise.all([
-                db.issuerProfile.findMany({
-                    where,
-                    skip,
-                    take: limit,
-                    orderBy: { approvedAt: 'desc' },
-                    select: {
-                        id: true,
-                        institutionName: true,
-                        institutionType: true,
-                        websiteUrl: true,
-                        logoUrl: true,
-                        approvedAt: true,
-                        _count: {
-                            select: { credentials: true },
-                        },
-                    },
-                }),
-                db.issuerProfile.count({ where }),
-            ]);
-
-            return reply.send({
-                issuers,
-                pagination: {
-                    page,
-                    limit,
-                    total,
-                    pages: Math.ceil(total / limit),
-                },
-            });
         }
+
+        if (type?.trim()) {
+            where.institutionType = type.trim();
+        }
+
+        const [issuers, total] = await Promise.all([
+            db.issuerProfile.findMany({
+                where,
+                skip,
+                take: limit,
+                orderBy: { approvedAt: 'desc' },
+                select: {
+                    id: true,
+                    institutionName: true,
+                    institutionType: true,
+                    websiteUrl: true,
+                    logoUrl: true,
+                    approvedAt: true,
+                    _count: {
+                        select: { credentials: true },
+                    },
+                },
+            }),
+            db.issuerProfile.count({ where }),
+        ]);
+
+        return reply.send({
+            issuers,
+            pagination: {
+                page,
+                limit,
+                total,
+                pages: Math.ceil(total / limit),
+            },
+        });
+    }
     );
 
     app.addHook('preHandler', authenticate)
