@@ -7,9 +7,13 @@ import { anchorQueue, emailQueue, bulkQueue } from '../../lib/queue.js'
 import { authenticate } from '../../hooks/authenticate.js'
 import { requireIssuer, requireApprovedIssuer } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
+import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
-import { createCipheriv, randomBytes } from 'node:crypto'
+import { createCipheriv, randomBytes, scrypt } from 'node:crypto'
+import { promisify } from 'node:util'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+
+const scryptAsync = promisify(scrypt)
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
@@ -74,7 +78,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireIssuer)
 
-    // ── PROFILE ──────────────────────────────────────────────────────────────
+    // ── PROFILE ─────────────────────────────────────────────────────────────────
 
     app.get('/me', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({
@@ -139,7 +143,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ profile })
     })
 
-    // ── ONBOARDING — STEP 1: Institution profile ──────────────────────────────
+    // ── ONBOARDING — STEP 1: Institution profile ────────────────────────────────
 
     app.post('/onboarding/step/1', async (req, reply) => {
         const body = z.object({
@@ -198,7 +202,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ success: true, message: 'Step 1 saved.' })
     })
 
-    // ── ONBOARDING — STEP 2: Signatory + NIN ─────────────────────────────────
+    // ── ONBOARDING — STEP 2: Signatory + NIN ────────────────────────────────────
 
     app.post('/onboarding/step/2', async (req, reply) => {
         const body = z.object({
@@ -242,7 +246,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ success: true, message: 'Step 2 saved.' })
     })
 
-    // ── ONBOARDING — DOCUMENT UPLOAD ─────────────────────────────────────────
+    // ── ONBOARDING — DOCUMENT UPLOAD ────────────────────────────────────────────
 
     app.post('/onboarding/documents', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
@@ -352,7 +356,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(204).send()
     })
 
-    // ── ONBOARDING — STEP 3: Submit for review ────────────────────────────────
+    // ── ONBOARDING — STEP 3: Submit for review ──────────────────────────────────
 
     app.post('/onboarding/step/3', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({
@@ -401,7 +405,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ success: true, message: 'Application submitted for review.' })
     })
 
-    // ── CREDENTIALS ───────────────────────────────────────────────────────────
+    // ── CREDENTIALS ──────────────────────────────────────────────────────────────
 
     app.get('/me/credentials', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const query = z.object({
@@ -468,7 +472,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ credential: cred })
     })
 
-    // ── ANALYTICS ─────────────────────────────────────────────────────────────
+    // ── ANALYTICS ────────────────────────────────────────────────────────────────
 
     app.get('/me/analytics', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const query = z.object({
@@ -560,7 +564,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const countriesReached = geo.length  // already queried above as top 10
         const topCountry = geoReach[0]?.country ?? null
 
-        // ── VERIFIER NAME RESOLUTION (unchanged) ─────────────────────────────
+        // ── VERIFIER NAME RESOLUTION (unchanged) ──────────────────────────────
         const verifierIds = topVerifiers.map(v => v.verifierId!).filter(Boolean)
         const verifierProfiles = await db.verifierProfile.findMany({
             where: { id: { in: verifierIds } },
@@ -601,7 +605,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         })
     })
 
-    // ── BULK ISSUANCE ─────────────────────────────────────────────────────────
+    // ── BULK ISSUANCE ────────────────────────────────────────────────────────────
 
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const body = z.object({
@@ -655,7 +659,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ job })
     })
 
-    // ── TEAM ──────────────────────────────────────────────────────────────────
+    // ── TEAM ─────────────────────────────────────────────────────────────────────
 
     app.get('/me/team', async (req, reply) => {
         const members = await db.issuerTeamMember.findMany({
@@ -725,7 +729,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Member removed' })
     })
 
-    // ── QR TEMPLATE ───────────────────────────────────────────────────────────
+    // ── QR TEMPLATE ──────────────────────────────────────────────────────────────
 
     app.get('/me/qr-template', async (req, reply) => {
         const t = await db.whitelabelPortal.findUnique({
@@ -751,7 +755,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ template: t })
     })
 
-    // ── VERIFICATION HISTORY ──────────────────────────────────────────────────
+    // ── VERIFICATION HISTORY ─────────────────────────────────────────────────────
 
     app.get('/me/verifications', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const query = z.object({
@@ -774,9 +778,89 @@ export default async function issuerRoutes(app: FastifyInstance) {
 
         return reply.status(200).send({ logs, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
+
+    // ── PASSWORD CHANGE ──────────────────────────────────────────────────────────
+    // Issuer passwords: minimum 12 characters per TRD §3.2.2.
+    // All refresh tokens revoked on change — forces re-login everywhere.
+
+    app.patch('/me/password', async (req, reply) => {
+        const body = z.object({
+            currentPassword: z.string(),
+            newPassword: z.string().min(12).max(128),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { id: true, passwordHash: true } })
+        if (!user) return reply.status(404).send({ error: 'Not found' })
+
+        if (!await verifyPwd(body.data.currentPassword, user.passwordHash)) {
+            return reply.status(401).send({ error: 'Unauthorized', message: 'Current password is incorrect' })
+        }
+
+        await db.user.update({ where: { id: req.userId! }, data: { passwordHash: await hashPwd(body.data.newPassword), failedLoginCount: 0 } })
+        await revokeAllUserTokens(req.userId!)
+
+        // Revoke all active sessions — password change invalidates everything
+        await db.userSession.updateMany({
+            where: { userId: req.userId!, isActive: true },
+            data: { isActive: false, revokedAt: new Date() },
+        }).catch(() => { })
+
+        audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: req.userId! })
+
+        return reply.status(200).send({ message: 'Password updated. Please log in again.' })
+    })
+
+    // ── SESSIONS ─────────────────────────────────────────────────────────────────
+    // Mirrors the holder session management pattern. Sessions are stored
+    // in user_sessions keyed by userId, so the same queries apply.
+
+    app.get('/me/sessions', async (req, reply) => {
+        const sessions = await db.userSession.findMany({
+            where: { userId: req.userId!, isActive: true },
+            select: { id: true, ipAddress: true, userAgent: true, country: true, city: true, lastSeenAt: true, createdAt: true },
+            orderBy: { lastSeenAt: 'desc' },
+        })
+        return reply.status(200).send({ sessions })
+    })
+
+    app.delete('/me/sessions/:sessionId', async (req, reply) => {
+        const { sessionId } = req.params as { sessionId: string }
+        const s = await db.userSession.findUnique({ where: { id: sessionId }, select: { userId: true } })
+        if (!s || s.userId !== req.userId) return reply.status(404).send({ error: 'Not found' })
+        await db.userSession.update({ where: { id: sessionId }, data: { isActive: false, revokedAt: new Date() } })
+        audit({ action: 'TOKEN_REVOKED', req, targetType: 'user_session', targetId: sessionId })
+        return reply.status(200).send({ message: 'Session revoked' })
+    })
+
+    app.delete('/me/sessions', async (req, reply) => {
+        await db.userSession.updateMany({ where: { userId: req.userId!, isActive: true }, data: { isActive: false, revokedAt: new Date() } })
+        await revokeAllUserTokens(req.userId!)
+        audit({ action: 'TOKEN_REVOKED', req, targetType: 'user', targetId: req.userId!, metadata: { scope: 'all_sessions' } })
+        return reply.status(200).send({ message: 'All sessions revoked' })
+    })
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
+// ── HELPERS ──────────────────────────────────────────────────────────────────────
+
+const scryptAsyncHelper = scryptAsync
+
+async function verifyPwd(input: string, stored: string): Promise<boolean> {
+    const [salt, hash] = stored.split(':')
+    if (!salt || !hash) return false
+    const key = await scryptAsyncHelper(input, salt, 64) as Buffer
+    const ref = Buffer.from(hash, 'hex')
+    if (key.length !== ref.length) return false
+    let diff = 0
+    for (let i = 0; i < key.length; i++) diff |= (key[i] ?? 0) ^ (ref[i] ?? 0)
+    return diff === 0
+}
+
+async function hashPwd(p: string): Promise<string> {
+    const salt = randomBytes(32).toString('hex')
+    const key = await scryptAsyncHelper(p, salt, 64) as Buffer
+    return `${salt}:${key.toString('hex')}`
+}
 
 async function buildDailySeries(issuerId: string, from: Date, type: 'issued' | 'verified') {
     if (type === 'issued') {

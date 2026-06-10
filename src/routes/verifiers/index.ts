@@ -1,19 +1,43 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
+import { scrypt, randomBytes } from 'node:crypto'
+import { promisify } from 'node:util'
 import { db } from '../../lib/db.js'
 import { generateApiKey, generateWebhookSecret, encrypt, sha256 } from '../../lib/crypto.js'
 import { authenticate } from '../../hooks/authenticate.js'
 import { requireVerifier } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { redis, keys } from '../../lib/redis.js'
-import { webhookQueue } from '../../lib/queue.js'
+import { webhookQueue, bulkQueue } from '../../lib/queue.js'
+import { revokeAllUserTokens } from '../../lib/jwt.js'
+
+const scryptAsync = promisify(scrypt)
+
+// ── PASSWORD HELPERS ─────────────────────────────────────────────────
+
+async function verifyPwd(input: string, stored: string): Promise<boolean> {
+    const [salt, hash] = stored.split(':')
+    if (!salt || !hash) return false
+    const key = await scryptAsync(input, salt, 64) as Buffer
+    const ref = Buffer.from(hash, 'hex')
+    if (key.length !== ref.length) return false
+    let diff = 0
+    for (let i = 0; i < key.length; i++) diff |= (key[i] ?? 0) ^ (ref[i] ?? 0)
+    return diff === 0
+}
+
+async function hashPwd(p: string): Promise<string> {
+    const salt = randomBytes(32).toString('hex')
+    const key = await scryptAsync(p, salt, 64) as Buffer
+    return `${salt}:${key.toString('hex')}`
+}
 
 export default async function verifierRoutes(app: FastifyInstance) {
 
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireVerifier)
 
-    // ── PROFILE ───────────────────────────────────────────────────
+    // ── PROFILE ─────────────────────────────────────────────────────────
     app.get('/me', async (req, reply) => {
         const user = await db.user.findUnique({
             where: { id: req.userId! },
@@ -40,7 +64,7 @@ export default async function verifierRoutes(app: FastifyInstance) {
         return reply.status(200).send({ profile })
     })
 
-    // ── API KEYS ──────────────────────────────────────────────────
+    // ── API KEYS ────────────────────────────────────────────────────────
     app.get('/me/api-keys', async (req, reply) => {
         const apiKeys = await db.apiKey.findMany({ where: { verifierId: req.verifierId!, isActive: true }, select: { id: true, name: true, keyPrefix: true, environment: true, scopes: true, lastUsedAt: true, lastUsedIp: true, callCount: true, createdAt: true }, orderBy: { createdAt: 'desc' } })
         return reply.status(200).send({ apiKeys })
@@ -92,7 +116,7 @@ export default async function verifierRoutes(app: FastifyInstance) {
         return reply.status(201).send({ ...newKey, key: plaintext, warning: 'Update your integrations with this new key.' })
     })
 
-    // ── WEBHOOKS ──────────────────────────────────────────────────
+    // ── WEBHOOKS ────────────────────────────────────────────────────────
     app.get('/me/webhooks', async (req, reply) => {
         const webhooks = await db.webhook.findMany({ where: { verifierId: req.verifierId! }, select: { id: true, name: true, url: true, events: true, isActive: true, lastDeliveredAt: true, failureCount: true, createdAt: true, deliveries: { take: 5, orderBy: { createdAt: 'desc' }, select: { success: true, statusCode: true, createdAt: true, event: true } } }, orderBy: { createdAt: 'desc' } })
         return reply.status(200).send({ webhooks })
@@ -121,7 +145,7 @@ export default async function verifierRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Webhook deleted' })
     })
 
-    // ── WEBHOOK TEST DELIVERY ──────────────────────────────────────
+    // ── WEBHOOK TEST DELIVERY ───────────────────────────────────────────
     app.post('/me/webhooks/:id/test', async (req, reply) => {
         const { id } = req.params as { id: string }
 
@@ -153,7 +177,7 @@ export default async function verifierRoutes(app: FastifyInstance) {
                     sent_at: new Date().toISOString(),
                 },
             },
-        
+
             { attempts: 1, delay: 0, removeOnComplete: true, removeOnFail: true }
         )
 
@@ -166,7 +190,71 @@ export default async function verifierRoutes(app: FastifyInstance) {
         })
     })
 
-    // ── VERIFICATION HISTORY ──────────────────────────────────────
+    // ── BULK VERIFICATION JOBS ──────────────────────────────────────────
+    // POST creates a bulk verification job (the bulk worker already
+    // handles type 'verification' — this route was the missing producer).
+    // GET endpoints power the dashboard's bulk results display.
+
+    app.post('/me/bulk-jobs', async (req, reply) => {
+        const body = z.object({
+            credential_ids: z.array(z.string().min(1).max(100)).min(1).max(10000),
+            filename: z.string().max(200).optional(),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        // One active job per verifier — mirrors issuer bulk constraint
+        const activeJob = await db.bulkJob.findFirst({
+            where: { verifierId: req.verifierId!, status: { in: ['PENDING', 'PROCESSING'] } },
+            select: { id: true },
+        })
+        if (activeJob) {
+            return reply.status(409).send({
+                error: 'Conflict',
+                message: 'A bulk verification job is already in progress. Wait for it to complete before starting another.',
+            })
+        }
+
+        const rows = body.data.credential_ids.map(id => ({ credential_id: id }))
+
+        const job = await db.bulkJob.create({
+            data: {
+                type: 'verification',
+                verifierId: req.verifierId!,
+                filename: body.data.filename ?? `bulk_verify_${Date.now()}.csv`,
+                totalRows: rows.length,
+                status: 'PENDING',
+            },
+        })
+
+        await bulkQueue.add('bulk-verification', {
+            jobId: job.id,
+            type: 'verification',
+            fileKey: JSON.stringify(rows),
+            verifierId: req.verifierId!,
+        })
+
+        audit({ action: 'BULK_VERIFICATION_STARTED', req, targetType: 'bulk_job', targetId: job.id, metadata: { rows: rows.length } })
+
+        return reply.status(202).send({ jobId: job.id, status: 'PENDING', rows: rows.length })
+    })
+
+    app.get('/me/bulk-jobs', async (req, reply) => {
+        const jobs = await db.bulkJob.findMany({
+            where: { verifierId: req.verifierId!, type: 'verification' },
+            orderBy: { createdAt: 'desc' },
+            take: 20,
+        })
+        return reply.status(200).send({ jobs })
+    })
+
+    app.get('/me/bulk-jobs/:id', async (req, reply) => {
+        const { id } = req.params as { id: string }
+        const job = await db.bulkJob.findUnique({ where: { id } })
+        if (!job || job.verifierId !== req.verifierId) return reply.status(404).send({ error: 'Not found' })
+        return reply.status(200).send({ job })
+    })
+
+    // ── VERIFICATION HISTORY ────────────────────────────────────────────
     app.get('/me/verifications', async (req, reply) => {
         const query = z.object({ page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25), result: z.enum(['ACTIVE', 'REVOKED', 'FROZEN', 'EXPIRED']).optional(), method: z.enum(['DASHBOARD', 'QR_SCAN', 'API', 'BULK_CSV']).optional() }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
@@ -182,7 +270,7 @@ export default async function verifierRoutes(app: FastifyInstance) {
         return reply.status(200).send({ logs, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
 
-    // ── USAGE ─────────────────────────────────────────────────────
+    // ── USAGE ───────────────────────────────────────────────────────────
     app.get('/me/usage', async (req, reply) => {
         const now = new Date()
         const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
@@ -203,5 +291,64 @@ export default async function verifierRoutes(app: FastifyInstance) {
             },
             apiKeys,
         })
+    })
+
+    // ── PASSWORD CHANGE ─────────────────────────────────────────────────
+    // Verifier passwords: minimum 8 characters per TRD §3.2.2.
+    // All refresh tokens and sessions revoked on change.
+
+    app.patch('/me/password', async (req, reply) => {
+        const body = z.object({
+            currentPassword: z.string(),
+            newPassword: z.string().min(8).max(128),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { id: true, passwordHash: true } })
+        if (!user) return reply.status(404).send({ error: 'Not found' })
+
+        if (!await verifyPwd(body.data.currentPassword, user.passwordHash)) {
+            return reply.status(401).send({ error: 'Unauthorized', message: 'Current password is incorrect' })
+        }
+
+        await db.user.update({ where: { id: req.userId! }, data: { passwordHash: await hashPwd(body.data.newPassword), failedLoginCount: 0 } })
+        await revokeAllUserTokens(req.userId!)
+
+        await db.userSession.updateMany({
+            where: { userId: req.userId!, isActive: true },
+            data: { isActive: false, revokedAt: new Date() },
+        }).catch(() => { })
+
+        audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: req.userId! })
+
+        return reply.status(200).send({ message: 'Password updated. Please log in again.' })
+    })
+
+    // ── SESSIONS ────────────────────────────────────────────────────────
+    // Mirrors the holder session management pattern.
+
+    app.get('/me/sessions', async (req, reply) => {
+        const sessions = await db.userSession.findMany({
+            where: { userId: req.userId!, isActive: true },
+            select: { id: true, ipAddress: true, userAgent: true, country: true, city: true, lastSeenAt: true, createdAt: true },
+            orderBy: { lastSeenAt: 'desc' },
+        })
+        return reply.status(200).send({ sessions })
+    })
+
+    app.delete('/me/sessions/:sessionId', async (req, reply) => {
+        const { sessionId } = req.params as { sessionId: string }
+        const s = await db.userSession.findUnique({ where: { id: sessionId }, select: { userId: true } })
+        if (!s || s.userId !== req.userId) return reply.status(404).send({ error: 'Not found' })
+        await db.userSession.update({ where: { id: sessionId }, data: { isActive: false, revokedAt: new Date() } })
+        audit({ action: 'TOKEN_REVOKED', req, targetType: 'user_session', targetId: sessionId })
+        return reply.status(200).send({ message: 'Session revoked' })
+    })
+
+    app.delete('/me/sessions', async (req, reply) => {
+        await db.userSession.updateMany({ where: { userId: req.userId!, isActive: true }, data: { isActive: false, revokedAt: new Date() } })
+        await revokeAllUserTokens(req.userId!)
+        audit({ action: 'TOKEN_REVOKED', req, targetType: 'user', targetId: req.userId!, metadata: { scope: 'all_sessions' } })
+        return reply.status(200).send({ message: 'All sessions revoked' })
     })
 }
