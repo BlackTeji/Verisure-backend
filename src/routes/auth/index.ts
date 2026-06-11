@@ -226,7 +226,8 @@ export default async function authRoutes(app: FastifyInstance) {
             setRefreshCookie(reply, refreshToken, expiresAt)
             audit({ action: 'USER_LOGIN', req, targetType: 'user', targetId: user.id })
 
-            return reply.status(200).send({ accessToken, user: { id: user.id, email: user.email, role: user.role } })
+            return reply.status(200).send({ accessToken, refreshToken, user: { id: user.id, email: user.email, role: user.role } })
+
         } catch (err) {
             app.log.error({ err }, 'Login error')
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
@@ -261,7 +262,8 @@ export default async function authRoutes(app: FastifyInstance) {
             setRefreshCookie(reply, newRefresh, expiresAt)
             audit({ action: 'TOKEN_REFRESHED', req, targetType: 'user', targetId: user.id })
 
-            return reply.status(200).send({ accessToken })
+            return reply.status(200).send({ accessToken, refreshToken: newRefresh })
+
         } catch {
             clearRefreshCookie(reply)
             return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid refresh token' })
