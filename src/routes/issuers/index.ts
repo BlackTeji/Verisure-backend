@@ -119,7 +119,14 @@ export default async function issuerRoutes(app: FastifyInstance) {
             signatoryNin: profile.signatoryNin ? 'XXX-XXXX-XXXXX' : null,
         }
 
-        return reply.status(200).send({ profile: safeProfile })
+        const user = await db.user.findUnique({
+            where: { id: req.userId! },
+            select: { twoFactorEnabled: true },
+        })
+
+        return reply.status(200).send({
+            profile: { ...safeProfile, twoFactorEnabled: user?.twoFactorEnabled ?? false }
+        })
     })
 
     app.patch('/me', async (req, reply) => {

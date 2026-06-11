@@ -38,7 +38,7 @@ function setRefreshCookie(reply: any, token: string, expiresAt: Date): void {
     reply.setCookie(COOKIE, token, {
         httpOnly: true,
         secure: true,
-        sameSite: 'none',
+        sameSite: 'strict',
         path: '/api/v1/auth/refresh',
         expires: expiresAt,
     })
@@ -47,11 +47,10 @@ function setRefreshCookie(reply: any, token: string, expiresAt: Date): void {
 function clearRefreshCookie(reply: any): void {
     reply.clearCookie(COOKIE, {
         path: '/api/v1/auth/refresh',
-        sameSite: 'none',
+        sameSite: 'strict',
         secure: true,
     })
 }
-
 // ── SCHEMAS ───────────────────────────────────────────────────────────────
 
 const signupSchema = z.object({
