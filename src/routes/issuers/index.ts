@@ -471,12 +471,25 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 verifications: {
                     take: 10,
                     orderBy: { verifiedAt: 'desc' },
-                    select: { id: true, method: true, result: true, verifiedAt: true, ipAddress: true, country: true },
+                    select: {
+                        id: true,
+                        method: true,
+                        result: true,
+                        verifiedAt: true,
+                        ipAddress: true,
+                        country: true,
+                    },
                 },
             },
         })
         if (!cred || cred.issuerId !== req.issuerId) return reply.status(404).send({ error: 'Not found' })
-        return reply.status(200).send({ credential: cred })
+
+        const serialisable = {
+            ...cred,
+            blockNumber: cred.blockNumber != null ? cred.blockNumber.toString() : null,
+        }
+
+        return reply.status(200).send({ credential: serialisable })
     })
 
     // ── ANALYTICS ────────────────────────────────────────────────────────────────

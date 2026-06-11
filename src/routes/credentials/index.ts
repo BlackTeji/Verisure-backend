@@ -121,6 +121,15 @@ export default async function credentialRoutes(app: FastifyInstance) {
 
         trackVerificationRate(req).catch(() => { })
 
+        let resolvedVerifierId = req.verifierId ?? null
+        if (!resolvedVerifierId && req.userId && req.userRole === 'VERIFIER') {
+            const vProfile = await db.verifierProfile.findUnique({
+                where: { userId: req.userId },
+                select: { id: true },
+            }).catch(() => null)
+            resolvedVerifierId = vProfile?.id ?? null
+        }
+
         const credential = await db.credential.findUnique({
             where: { id: credentialId },
             include: { issuer: { select: { id: true, institutionName: true, institutionType: true, status: true } } },
@@ -130,7 +139,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
             await db.verificationLog.create({
                 data: {
                     credentialId,
-                    verifierId: req.verifierId ?? null,
+                    verifierId: resolvedVerifierId,
                     apiKeyId: req.apiKeyId ?? null,
                     method: deriveMethod(req),
                     result: 'REVOKED',
@@ -171,7 +180,7 @@ export default async function credentialRoutes(app: FastifyInstance) {
         await db.verificationLog.create({
             data: {
                 credentialId: credential.id,
-                verifierId: req.verifierId ?? null,
+                verifierId: resolvedVerifierId,
                 apiKeyId: req.apiKeyId ?? null,
                 method,
                 result: effectiveStatus as any,
@@ -182,9 +191,9 @@ export default async function credentialRoutes(app: FastifyInstance) {
             },
         })
 
-        if (req.verifierId) {
+        if (resolvedVerifierId) {
             const webhooks = await db.webhook.findMany({
-                where: { verifierId: req.verifierId, isActive: true, events: { has: 'credential.verified' } },
+                where: { verifierId: resolvedVerifierId, isActive: true, events: { has: 'credential.verified' } },
                 select: { id: true },
             })
             for (const wh of webhooks) {
