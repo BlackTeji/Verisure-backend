@@ -31,13 +31,15 @@ const app = Fastify({
     bodyLimit: 1_048_576,
 })
 
-// ── PLUGINS ───────────────────────────────────────────────────
+// ── PLUGINS ───────────────────────────────────────────────────────────────
+
 await app.register(FastifyHelmet, {
     contentSecurityPolicy: {
         directives: { defaultSrc: ["'none'"], scriptSrc: ["'none'"], styleSrc: ["'none'"], imgSrc: ["'none'"] },
     },
-    crossOriginEmbedderPolicy: true,
-    crossOriginOpenerPolicy: true,
+
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
     dnsPrefetchControl: { allow: false },
     frameguard: { action: 'deny' },
     hidePoweredBy: true,
@@ -48,8 +50,14 @@ await app.register(FastifyHelmet, {
 
 await app.register(FastifyCors, {
     origin: (origin, cb) => {
-        if (!origin || env.ALLOWED_ORIGINS.includes(origin)) cb(null, true)
-        else cb(new Error('Not allowed by CORS'), false)
+        if (!origin) return cb(null, true)
+
+        if (env.ALLOWED_ORIGINS.includes(origin)) {
+            return cb(null, true)
+        }
+
+        logger.warn({ origin, allowed: env.ALLOWED_ORIGINS }, 'cors: rejected origin')
+        return cb(new Error(`CORS: origin '${origin}' not in ALLOWED_ORIGINS`), false)
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With'],
@@ -57,7 +65,7 @@ await app.register(FastifyCors, {
     maxAge: 600,
 })
 
-await app.register(FastifyCookie as any, { secret: env.JWT_REFRESH_SECRET })
+await app.register(FastifyCookie as any)
 
 await app.register(FastifyRateLimit, {
     global: true,
@@ -84,7 +92,8 @@ if (env.NODE_ENV !== 'production') {
     await app.register(FastifySwaggerUi, { routePrefix: '/api/docs' })
 }
 
-// ── GLOBAL HOOKS ──────────────────────────────────────────────
+// ── GLOBAL HOOKS ──────────────────────────────────────────────────────────
+
 app.addHook('onSend', async (_req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff')
     reply.header('X-Frame-Options', 'DENY')
@@ -94,7 +103,8 @@ app.addHook('onSend', async (_req, reply) => {
 
 app.addHook('onRequest', checkBlockedIp)
 
-// ── ROUTES ────────────────────────────────────────────────────
+// ── ROUTES ────────────────────────────────────────────────────────────────
+
 app.get('/api/health', async (_req, reply) =>
     reply.status(200).send({ status: 'ok', timestamp: new Date().toISOString(), env: env.NODE_ENV }))
 
@@ -105,7 +115,8 @@ await app.register(holderRoutes, { prefix: '/api/v1/holders' })
 await app.register(verifierRoutes, { prefix: '/api/v1/verifiers' })
 await app.register(adminRoutes, { prefix: '/api/v1/admin' })
 
-// ── ERROR HANDLERS ────────────────────────────────────────────
+// ── ERROR HANDLERS ────────────────────────────────────────────────────────
+
 app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not found' }))
 
 app.setErrorHandler((err, _req, reply) => {
@@ -119,7 +130,8 @@ app.setErrorHandler((err, _req, reply) => {
     })
 })
 
-// ── STARTUP ───────────────────────────────────────────────────
+// ── STARTUP ───────────────────────────────────────────────────────────────
+
 async function start() {
     try {
         await db.$connect()
@@ -139,7 +151,8 @@ async function start() {
     }
 }
 
-// ── SHUTDOWN ──────────────────────────────────────────────────
+// ── SHUTDOWN ──────────────────────────────────────────────────────────────
+
 async function shutdown(signal: string) {
     logger.info({ signal }, 'shutting down')
     try {
