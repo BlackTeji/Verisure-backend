@@ -510,9 +510,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         ])
 
         // ── REACH METRICS — holder-driven signals ─────────────────────────────
-        // These measure how far credentials travel independent of formal verifier
-        // registrations. An issuer with 0 registered verifiers can still have
-        // thousands of link views from holders sharing directly with employers.
+
         const [
             totalShares,
             sharesInPeriod,
@@ -521,23 +519,22 @@ export default async function issuerRoutes(app: FastifyInstance) {
             unclaimedCredentials,
             geoReach,
         ] = await Promise.all([
-            // Total share grants created for credentials issued by this institution
+
             db.shareGrant.count({
                 where: { credential: { issuerId } },
             }),
-            // Share grants created within the current period
+
             db.shareGrant.count({
                 where: { credential: { issuerId }, createdAt: { gte: from } },
             }),
-            // Verification link views: QR scans + share grant accesses
-            // These represent employer/third-party views without a registered account
+
             db.verificationLog.count({
                 where: {
                     credential: { issuerId },
                     method: { in: ['QR_SCAN', 'SELF_VERIFY'] },
                 },
             }),
-            // Link opens within the current period
+
             db.verificationLog.count({
                 where: {
                     credential: { issuerId },
@@ -545,13 +542,11 @@ export default async function issuerRoutes(app: FastifyInstance) {
                     verifiedAt: { gte: from },
                 },
             }),
-            // Credentials that haven't been claimed by a holder yet
-            // (issued to an email with no VeriSure account)
+
             db.credential.count({
                 where: { issuerId, holderUserId: null, status: { not: 'REVOKED' } },
             }),
-            // Geographic reach — distinct countries across ALL verification methods
-            // (not just registered verifiers)
+
             db.verificationLog.groupBy({
                 by: ['country'],
                 where: { credential: { issuerId }, country: { not: null } },
@@ -561,7 +556,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             }),
         ])
 
-        const countriesReached = geo.length  // already queried above as top 10
+        const countriesReached = geo.length
         const topCountry = geoReach[0]?.country ?? null
 
         // ── VERIFIER NAME RESOLUTION (unchanged) ──────────────────────────────
@@ -586,8 +581,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 revocationRate: totalIssued > 0 ? ((revoked / totalIssued) * 100).toFixed(2) + '%' : '0%',
                 pendingAnchor: anchorPending,
             },
-            // Holder-driven reach metrics — visible in the issuer analytics dashboard.
-            // These compound independently of the verifier network size.
+
             reach: {
                 totalShares,
                 sharesInPeriod,
@@ -780,8 +774,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
     })
 
     // ── PASSWORD CHANGE ──────────────────────────────────────────────────────────
-    // Issuer passwords: minimum 12 characters per TRD §3.2.2.
-    // All refresh tokens revoked on change — forces re-login everywhere.
 
     app.patch('/me/password', async (req, reply) => {
         const body = z.object({
@@ -812,8 +804,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
     })
 
     // ── SESSIONS ─────────────────────────────────────────────────────────────────
-    // Mirrors the holder session management pattern. Sessions are stored
-    // in user_sessions keyed by userId, so the same queries apply.
 
     app.get('/me/sessions', async (req, reply) => {
         const sessions = await db.userSession.findMany({
@@ -839,6 +829,41 @@ export default async function issuerRoutes(app: FastifyInstance) {
         audit({ action: 'TOKEN_REVOKED', req, targetType: 'user', targetId: req.userId!, metadata: { scope: 'all_sessions' } })
         return reply.status(200).send({ message: 'All sessions revoked' })
     })
+
+    // ── 2FA ──────────────────────────────────────────────────────────────────────
+
+    app.post('/me/2fa/setup', async (req, reply) => {
+        const { generateTotpSecret, encrypt } = await import('../../lib/crypto.js')
+        const secret = generateTotpSecret()
+        const encrypted = encrypt(secret)
+        await db.user.update({ where: { id: req.userId! }, data: { twoFactorSecret: encrypted } })
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { email: true } })
+        const totpUri = `otpauth://totp/VeriSure:${user?.email}?secret=${secret}&issuer=VeriSure&algorithm=SHA1&digits=6&period=30`
+        return reply.status(200).send({ secret, totpUri })
+    })
+
+    app.post('/me/2fa/confirm', async (req, reply) => {
+        const body = z.object({ code: z.string().length(6) }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error' })
+
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { twoFactorSecret: true } })
+        if (!user?.twoFactorSecret) return reply.status(400).send({ error: 'Bad request', message: 'Setup not initiated. Call /me/2fa/setup first.' })
+
+        const { decrypt } = await import('../../lib/crypto.js')
+        const { authenticator } = await import('otplib')
+        const secret = decrypt(user.twoFactorSecret)
+        const isValid = authenticator.verify({ token: body.data.code, secret })
+        if (!isValid) return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid code. Try again.' })
+
+        await db.user.update({ where: { id: req.userId! }, data: { twoFactorEnabled: true } })
+        return reply.status(200).send({ message: '2FA enabled. You can now issue credentials.' })
+    })
+
+    app.delete('/me/2fa', async (req, reply) => {
+        await db.user.update({ where: { id: req.userId! }, data: { twoFactorEnabled: false, twoFactorSecret: null } })
+        return reply.status(200).send({ message: '2FA disabled.' })
+    })
+
 }
 
 // ── HELPERS ──────────────────────────────────────────────────────────────────────
