@@ -82,27 +82,46 @@ const wrap = (body: string) => `<!DOCTYPE html>
 // ── TEMPLATES ─────────────────────────────────────────────────
 
 export const templates = {
-
     credentialIssued: (d: {
         holderName: string
         credentialType: string
         issuerName: string
         credentialId: string
         verifyUrl: string
-    }) => ({
-        subject: `Your ${d.credentialType} from ${d.issuerName} is ready`,
-        html: wrap(`
-            <h1>Your credential is ready.</h1>
-            <p>Hi ${d.holderName},</p>
-            <p><strong>${d.issuerName}</strong> has issued you a verified credential on VeriSure. It is cryptographically secured and independently verifiable.</p>
-            <p><strong>Credential type:</strong> ${d.credentialType}<br>
-            <strong>Issued by:</strong> ${d.issuerName}</p>
-            <p class="mono">${d.credentialId}</p>
-            <a href="${d.verifyUrl}" class="btn">View your credential →</a>
-            <p style="margin-top:20px;font-size:13px">Anyone can verify this credential at any time using the link above or by scanning the QR code on your certificate.</p>
-        `),
-        text: `Your ${d.credentialType} from ${d.issuerName} is ready on VeriSure.\n\nCredential ID: ${d.credentialId}\n\nVerify: ${d.verifyUrl}`,
-    }),
+        ctaUrl?: string
+        hasAccount?: boolean
+    }) => {
+        const cta = d.ctaUrl ?? d.verifyUrl
+        const ctaLabel = d.ctaUrl
+            ? (d.hasAccount ? 'Sign in to view your credential →' : 'Claim your credential — create your free wallet →')
+            : 'View your credential →'
+        const walletLine = d.ctaUrl
+            ? (d.hasAccount
+                ? `<p>This credential has been added to your VeriSure wallet. Sign in to view, share, and download it.</p>`
+                : `<p>Create your free VeriSure wallet to claim this credential. It takes under a minute — your credential will be waiting for you when you sign in.</p>`)
+            : ''
+
+        return {
+            subject: `Your ${d.credentialType} from ${d.issuerName} is ready`,
+            html: wrap(`
+                <h1>Your credential is ready.</h1>
+                <p>Hi ${d.holderName},</p>
+                <p><strong>${d.issuerName}</strong> has issued you a verified credential on VeriSure. It is cryptographically secured and independently verifiable.</p>
+                <p><strong>Credential type:</strong> ${d.credentialType}<br>
+                <strong>Issued by:</strong> ${d.issuerName}</p>
+                <p class="mono">${d.credentialId}</p>
+                ${walletLine}
+                <a href="${cta}" class="btn">${ctaLabel}</a>
+                <p style="margin-top:20px;font-size:13px">Anyone can verify this credential at any time at <a href="${d.verifyUrl}" style="color:#D94010;text-decoration:none">verisure.ng/verify</a> or by scanning the QR code on your certificate.</p>
+            `),
+            text: d.ctaUrl
+                ? (d.hasAccount
+                    ? `Your ${d.credentialType} from ${d.issuerName} is ready on VeriSure.\n\nCredential ID: ${d.credentialId}\n\nSign in to view it: ${cta}\n\nVerify: ${d.verifyUrl}`
+                    : `Your ${d.credentialType} from ${d.issuerName} is ready on VeriSure.\n\nCredential ID: ${d.credentialId}\n\nCreate your free wallet to claim it: ${cta}\n\nVerify: ${d.verifyUrl}`)
+                : `Your ${d.credentialType} from ${d.issuerName} is ready on VeriSure.\n\nCredential ID: ${d.credentialId}\n\nVerify: ${d.verifyUrl}`,
+        }
+    },
+
 
     emailVerification: (d: { name: string; verifyUrl: string }) => ({
         subject: 'Verify your VeriSure email address',

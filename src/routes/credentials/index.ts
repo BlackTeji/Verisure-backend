@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { db } from '../../lib/db.js'
 import { generateCredentialId, hashCredential } from '../../lib/crypto.js'
-import { sha256 } from '../../lib/crypto.js'
+import { sha256, generateSecureToken } from '../../lib/crypto.js'
 import { anchorQueue, emailQueue, webhookQueue } from '../../lib/queue.js'
 import { authenticate, authenticateApiKey, authenticateOptional } from '../../hooks/authenticate.js'
 import { requireIssuer, requireApprovedIssuer, requireScope } from '../../hooks/authorize.js'
@@ -11,7 +11,29 @@ import { trackVerificationRate } from '../../hooks/rate-limit.js'
 import { verifyHashOnChain } from '../../lib/blockchain.js'
 import { env } from '../../config/env.js'
 
-// ── ISSUE ─────────────────────────────────────────────────────
+const CLAIM_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+async function resolveHolderAccount(email: string): Promise<{ id: string; firstName: string | null; lastName: string | null; email: string } | null> {
+    const direct = await db.user.findFirst({
+        where: { email, role: 'HOLDER' },
+        select: { id: true, firstName: true, lastName: true, email: true },
+    })
+    if (direct) return direct
+
+    const alias = await db.userEmailAlias.findUnique({
+        where: { email },
+        select: {
+            verifiedAt: true,
+            user: { select: { id: true, firstName: true, lastName: true, email: true, role: true } },
+        },
+    })
+    if (alias?.verifiedAt && alias.user.role === 'HOLDER') {
+        return { id: alias.user.id, firstName: alias.user.firstName, lastName: alias.user.lastName, email: alias.user.email }
+    }
+
+    return null
+}
+
 export default async function credentialRoutes(app: FastifyInstance) {
 
     app.post('/', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
@@ -28,7 +50,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
 
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-        // ── 2FA enforcement gate ─────────────────────────────
         const issuerProfile = await db.issuerProfile.findUnique({
             where: { id: req.issuerId! },
             select: { twoFactorRequired: true },
@@ -53,14 +74,12 @@ export default async function credentialRoutes(app: FastifyInstance) {
             ? new Date(d.expiryDate + (d.expiryDate.includes('T') ? '' : 'T00:00:00.000Z')).toISOString()
             : null
 
+        const holderAccount = await resolveHolderAccount(d.holderEmail)
+
         let holderName = d.holderName
         if (!holderName) {
-            const holderUser = await db.user.findUnique({
-                where: { email: d.holderEmail },
-                select: { firstName: true, lastName: true, email: true },
-            })
-            holderName = holderUser
-                ? ([holderUser.firstName, holderUser.lastName].filter(Boolean).join(' ') || holderUser.email)
+            holderName = holderAccount
+                ? ([holderAccount.firstName, holderAccount.lastName].filter(Boolean).join(' ') || holderAccount.email)
                 : d.holderEmail
         }
 
@@ -74,10 +93,20 @@ export default async function credentialRoutes(app: FastifyInstance) {
             notes: d.notes ?? null,
         })
 
+        let claimToken: string | null = null
+        let claimTokenHash: string | null = null
+        let claimTokenExpiresAt: Date | null = null
+        if (!holderAccount) {
+            claimToken = generateSecureToken()
+            claimTokenHash = sha256(claimToken)
+            claimTokenExpiresAt = new Date(Date.now() + CLAIM_TOKEN_TTL_MS)
+        }
+
         const credential = await db.credential.create({
             data: {
                 id, issuerId, holderName,
                 holderEmail: d.holderEmail,
+                holderUserId: holderAccount?.id ?? null,
                 credentialType: d.credentialType,
                 field: d.field ?? null,
                 notes: d.notes ?? null,
@@ -85,17 +114,26 @@ export default async function credentialRoutes(app: FastifyInstance) {
                 expiryDate: expiryDateISO ? new Date(expiryDateISO) : null,
                 sha256Hash,
                 status: 'ACTIVE',
-                dataSourceDeclared: (req.body as any).dataSourceDeclared === true,
-                dataSourceDeclaredAt: (req.body as any).dataSourceDeclared === true ? new Date() : null,
-                dataSourceDeclaredIp: (req.body as any).dataSourceDeclared === true ? req.ip : null,
+                dataSourceDeclared: d.dataSourceDeclared === true,
+                dataSourceDeclaredAt: d.dataSourceDeclared === true ? new Date() : null,
+                dataSourceDeclaredIp: d.dataSourceDeclared === true ? req.ip : null,
+                claimTokenHash,
+                claimTokenExpiresAt,
             },
-            select: { id: true, credentialType: true, holderName: true, holderEmail: true, issueDate: true, expiryDate: true, sha256Hash: true, status: true },
+            select: { id: true, credentialType: true, holderName: true, holderEmail: true, issueDate: true, expiryDate: true, sha256Hash: true, status: true, holderUserId: true },
         })
 
         const anchorJob = await anchorQueue.add('anchor', { credentialId: id, sha256Hash })
         await db.credential.update({ where: { id }, data: { anchorJobId: anchorJob.id } })
 
         const issuer = await db.issuerProfile.findUnique({ where: { id: issuerId }, select: { institutionName: true } })
+
+        const verifyUrl = `${env.FRONTEND_URL}/pages/verify.html?credential_id=${id}`
+        const encodedEmail = encodeURIComponent(d.holderEmail)
+        const ctaUrl = holderAccount
+            ? `${env.FRONTEND_URL}/pages/login.html?email=${encodedEmail}&credential_id=${id}`
+            : `${env.FRONTEND_URL}/pages/signup.html?role=holder&email=${encodedEmail}&credential_id=${id}&claim_token=${claimToken}`
+
         await emailQueue.add('credential_issued', {
             type: 'credential_issued',
             to: d.holderEmail,
@@ -104,16 +142,17 @@ export default async function credentialRoutes(app: FastifyInstance) {
                 credentialType: d.credentialType,
                 issuerName: issuer?.institutionName ?? '',
                 credentialId: id,
-                verifyUrl: `${env.FRONTEND_URL}/pages/verify.html?credential_id=${id}`,
+                verifyUrl,
+                ctaUrl,
+                hasAccount: !!holderAccount,
             },
         })
 
-        audit({ action: 'CREDENTIAL_ISSUED', req, targetType: 'credential', targetId: id, metadata: { credentialType: d.credentialType, holderEmail: d.holderEmail } })
+        audit({ action: 'CREDENTIAL_ISSUED', req, targetType: 'credential', targetId: id, metadata: { credentialType: d.credentialType, holderEmail: d.holderEmail, autoLinked: !!holderAccount } })
 
         return reply.status(201).send({ ...credential, anchorStatus: 'queued' })
     })
 
-    // ── VERIFY BY CREDENTIAL ID ───────────────────────────────
     app.get('/verify', { preHandler: authenticateOptional }, async (req, reply) => {
         const query = req.query as Record<string, string>
         const credentialId = query['credential_id']
@@ -235,7 +274,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send(response)
     })
 
-    // ── VERIFY BY SHARE TOKEN ─────────────────────────────────
     app.get('/verify-by-share', async (req, reply) => {
         const query = req.query as Record<string, string>
         const shareToken = query['share_token']
@@ -332,7 +370,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
         })
     })
 
-    // ── GET BY ID ─────────────────────────────────────────────
     app.get('/:id', { preHandler: authenticate }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const cred = await db.credential.findUnique({
@@ -348,10 +385,16 @@ export default async function credentialRoutes(app: FastifyInstance) {
             req.userRole === 'ADMIN'
         if (!isOwner) return reply.status(403).send({ error: 'Forbidden' })
 
-        return reply.status(200).send(cred)
+        const serialisable = {
+            ...cred,
+            blockNumber: cred.blockNumber != null ? cred.blockNumber.toString() : null,
+            claimTokenHash: undefined,
+            claimTokenExpiresAt: undefined,
+        }
+
+        return reply.status(200).send(serialisable)
     })
 
-    // ── REVOKE ────────────────────────────────────────────────
     app.patch('/:id/revoke', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const body = z.object({
@@ -400,7 +443,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential revoked', credentialId: id })
     })
 
-    // ── FREEZE ────────────────────────────────────────────────
     app.patch('/:id/freeze', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const body = z.object({ reason: z.string().min(1).max(500) }).safeParse(req.body)
@@ -417,7 +459,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential frozen', credentialId: id })
     })
 
-    // ── UNFREEZE ──────────────────────────────────────────────
     app.patch('/:id/unfreeze', { preHandler: [authenticate, requireIssuer, requireApprovedIssuer] }, async (req, reply) => {
         const { id } = req.params as { id: string }
         const cred = await db.credential.findUnique({ where: { id }, select: { issuerId: true, status: true } })
@@ -431,7 +472,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Credential unfrozen', credentialId: id })
     })
 
-    // ── BATCH VERIFY ──────────────────────────────────────────
     app.post('/verify/batch', { preHandler: [authenticateApiKey, requireScope('batch')] }, async (req, reply) => {
         const body = z.object({ credential_ids: z.array(z.string()).min(1).max(500) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
@@ -474,7 +514,6 @@ export default async function credentialRoutes(app: FastifyInstance) {
     })
 }
 
-// ── HELPERS ───────────────────────────────────────────────────
 function deriveMethod(req: any): 'DASHBOARD' | 'API' | 'QR_SCAN' | 'BULK_CSV' | 'SELF_VERIFY' {
     if (req.apiKeyId) return 'API'
     const query = req.query as Record<string, string>

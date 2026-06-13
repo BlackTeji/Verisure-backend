@@ -13,8 +13,6 @@ import { env } from '../../config/env.js'
 const scryptAsync = promisify(scrypt)
 const COOKIE = 'vrs_refresh'
 
-// ── PASSWORD ──────────────────────────────────────────────────────────────
-
 async function hashPassword(p: string): Promise<string> {
     const salt = randomBytes(32).toString('hex')
     const key = await scryptAsync(p, salt, 64) as Buffer
@@ -31,8 +29,6 @@ async function verifyPassword(p: string, stored: string): Promise<boolean> {
     for (let i = 0; i < key.length; i++) diff |= (key[i] ?? 0) ^ (ref[i] ?? 0)
     return diff === 0
 }
-
-// ── COOKIE HELPERS ────────────────────────────────────────────────────────
 
 function setRefreshCookie(reply: any, token: string, expiresAt: Date): void {
     reply.setCookie(COOKIE, token, {
@@ -51,7 +47,6 @@ function clearRefreshCookie(reply: any): void {
         secure: true,
     })
 }
-// ── SCHEMAS ───────────────────────────────────────────────────────────────
 
 const signupSchema = z.object({
     email: z.string().email().toLowerCase(),
@@ -72,11 +67,11 @@ const signupSchema = z.object({
     organisationType: z.string().optional(),
     teamSize: z.string().optional(),
     monthlyVolume: z.string().optional(),
+    claimToken: z.string().max(256).optional(),
+    credentialId: z.string().max(64).optional(),
 })
 
 export default async function authRoutes(app: FastifyInstance) {
-
-    // ── POST /signup ──────────────────────────────────────────────────────
 
     app.post('/signup', async (req, reply) => {
         try {
@@ -91,44 +86,97 @@ export default async function authRoutes(app: FastifyInstance) {
                 return reply.status(400).send({ error: 'Validation error', message: 'Institution details required' })
             }
 
+            let claimedCredential: { id: string } | null = null
+            if (d.role === 'HOLDER' && d.claimToken && d.credentialId) {
+                claimedCredential = await db.credential.findFirst({
+                    where: {
+                        id: d.credentialId,
+                        claimTokenHash: sha256(d.claimToken),
+                        holderEmail: d.email,
+                        holderUserId: null,
+                        claimTokenExpiresAt: { gt: new Date() },
+                    },
+                    select: { id: true },
+                })
+            }
+
             const passwordHash = await hashPassword(d.password)
 
-            const user = await db.$transaction(async tx => {
+            const result = await db.$transaction(async tx => {
                 const u = await tx.user.create({
-                    data: { email: d.email, passwordHash, role: d.role, firstName: d.firstName ?? null, lastName: d.lastName ?? null, phone: d.phone ?? null },
+                    data: {
+                        email: d.email,
+                        passwordHash,
+                        role: d.role,
+                        firstName: d.firstName ?? null,
+                        lastName: d.lastName ?? null,
+                        phone: d.phone ?? null,
+                        emailVerified: !!claimedCredential,
+                        emailVerifiedAt: claimedCredential ? new Date() : null,
+                    },
                     select: { id: true, email: true, role: true },
                 })
                 if (d.role === 'HOLDER') await tx.holderProfile.create({ data: { userId: u.id } })
                 if (d.role === 'ISSUER') await tx.issuerProfile.create({ data: { userId: u.id, institutionName: d.institutionName!, institutionType: d.institutionType ?? '', registrationNumber: d.registrationNumber ?? null, officialEmail: d.officialEmail!, phone: d.phone ?? null, contactFirstName: d.contactFirstName!, contactLastName: d.contactLastName!, contactTitle: d.contactTitle ?? null, annualVolume: d.annualVolume ?? null, status: 'PENDING' } })
                 if (d.role === 'VERIFIER') await tx.verifierProfile.create({ data: { userId: u.id, organisationName: d.organisationName ?? '', organisationType: d.organisationType ?? '', teamSize: d.teamSize ?? null, monthlyVolume: d.monthlyVolume ?? null } })
-                return u
+
+                let linkedCount = 0
+                if (claimedCredential) {
+                    const linked = await tx.credential.updateMany({
+                        where: { holderEmail: d.email, holderUserId: null },
+                        data: { holderUserId: u.id, claimTokenHash: null, claimTokenExpiresAt: null },
+                    })
+                    linkedCount = linked.count
+                }
+
+                return { user: u, linkedCount }
             })
 
-            const token = generateSecureToken()
-            const tokenHash = sha256(token)
-            await db.emailVerificationToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86_400_000) } })
+            const user = result.user
 
-            await emailQueue.add('email_verification', {
-                type: 'email_verification',
-                to: user.email,
-                name: d.firstName ?? d.institutionName ?? 'there',
-                data: { verifyUrl: `${env.FRONTEND_URL}/pages/verify-email.html?token=${token}` },
+            if (!claimedCredential) {
+                const token = generateSecureToken()
+                const tokenHash = sha256(token)
+                await db.emailVerificationToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 86_400_000) } })
+
+                await emailQueue.add('email_verification', {
+                    type: 'email_verification',
+                    to: user.email,
+                    name: d.firstName ?? d.institutionName ?? 'there',
+                    data: { verifyUrl: `${env.FRONTEND_URL}/pages/verify-email.html?token=${token}` },
+                })
+            }
+
+            audit({
+                action: 'USER_SIGNUP',
+                req,
+                targetType: 'user',
+                targetId: user.id,
+                metadata: {
+                    role: user.role,
+                    claimedViaToken: !!claimedCredential,
+                    linkedCredentials: result.linkedCount,
+                },
             })
-
-            audit({ action: 'USER_SIGNUP', req, targetType: 'user', targetId: user.id, metadata: { role: user.role } })
 
             const message = d.role === 'ISSUER'
                 ? 'Application received. You will be notified when reviewed.'
-                : 'Account created. Check your email to verify.'
+                : claimedCredential
+                    ? `Account created. ${result.linkedCount} credential${result.linkedCount === 1 ? ' has' : 's have'} been added to your wallet.`
+                    : 'Account created. Check your email to verify.'
 
-            return reply.status(201).send({ message, userId: user.id, role: user.role })
+            return reply.status(201).send({
+                message,
+                userId: user.id,
+                role: user.role,
+                emailVerified: !!claimedCredential,
+                linkedCredentials: result.linkedCount,
+            })
         } catch (err) {
             app.log.error({ err }, 'Signup error')
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
         }
     })
-
-    // ── POST /login ───────────────────────────────────────────────────────
 
     app.post('/login', async (req, reply) => {
         try {
@@ -183,7 +231,6 @@ export default async function authRoutes(app: FastifyInstance) {
                 data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastLoginIp: req.ip },
             })
 
-            // ── Session tracking + new device alert ───────────────────
             const userAgent = req.headers['user-agent']?.slice(0, 500) ?? 'Unknown'
             const clientIp = req.ip
 
@@ -215,7 +262,6 @@ export default async function authRoutes(app: FastifyInstance) {
                     },
                 }).catch(() => { /* alert failure must never break login */ })
             }
-            // ── End session tracking ──────────────────────────────────
 
             const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
                 issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
@@ -232,8 +278,6 @@ export default async function authRoutes(app: FastifyInstance) {
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
         }
     })
-
-    // ── POST /refresh ─────────────────────────────────────────────────────
 
     app.post('/refresh', async (req, reply) => {
         const token = (req.cookies as Record<string, string>)[COOKIE]
@@ -269,8 +313,6 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-    // ── POST /logout ──────────────────────────────────────────────────────
-
     app.post('/logout', { preHandler: authenticate }, async (req, reply) => {
         try {
             const token = req.headers.authorization?.slice(7)
@@ -291,7 +333,6 @@ export default async function authRoutes(app: FastifyInstance) {
                     where: { userId: req.userId, isRevoked: false },
                     data: { isRevoked: true, revokedAt: new Date() },
                 })
-                // Mark current session as inactive
                 await db.userSession.updateMany({
                     where: { userId: req.userId, ipAddress: req.ip, isActive: true },
                     data: { isActive: false, revokedAt: new Date() },
@@ -305,8 +346,6 @@ export default async function authRoutes(app: FastifyInstance) {
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
         }
     })
-
-    // ── GET /verify-email ─────────────────────────────────────────────────
 
     app.get('/verify-email', async (req, reply) => {
         try {
@@ -323,16 +362,23 @@ export default async function authRoutes(app: FastifyInstance) {
                 db.user.update({ where: { id: record.userId }, data: { emailVerified: true, emailVerifiedAt: new Date() } }),
             ])
 
-            const user = await db.user.findUnique({ where: { id: record.userId }, select: { role: true } })
+            const user = await db.user.findUnique({ where: { id: record.userId }, select: { email: true, role: true } })
 
-            return reply.status(200).send({ message: 'Email verified', role: user?.role ?? null })
+            let linkedCredentials = 0
+            if (user?.role === 'HOLDER') {
+                const linked = await db.credential.updateMany({
+                    where: { holderEmail: user.email, holderUserId: null },
+                    data: { holderUserId: record.userId, claimTokenHash: null, claimTokenExpiresAt: null },
+                }).catch(() => ({ count: 0 }))
+                linkedCredentials = linked.count
+            }
+
+            return reply.status(200).send({ message: 'Email verified', role: user?.role ?? null, linkedCredentials })
         } catch (err) {
             app.log.error({ err }, 'Email verification error')
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
         }
     })
-
-    // ── POST /resend-verification ─────────────────────────────────────────
 
     app.post('/resend-verification', async (req, reply) => {
         try {
@@ -371,8 +417,6 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-    // ── POST /forgot-password ─────────────────────────────────────────────
-
     app.post('/forgot-password', async (req, reply) => {
         try {
             const body = z.object({ email: z.string().email().toLowerCase() }).safeParse(req.body)
@@ -400,8 +444,6 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-    // ── GET /validate-reset-token ─────────────────────────────────────────
-
     app.get('/validate-reset-token', async (req, reply) => {
         try {
             const token = (req.query as Record<string, string>)['token']
@@ -418,8 +460,6 @@ export default async function authRoutes(app: FastifyInstance) {
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
         }
     })
-
-    // ── POST /reset-password ──────────────────────────────────────────────
 
     app.post('/reset-password', async (req, reply) => {
         try {
@@ -443,7 +483,6 @@ export default async function authRoutes(app: FastifyInstance) {
 
             await revokeAllUserTokens(record.userId)
 
-            // Revoke all active sessions on password reset
             await db.userSession.updateMany({
                 where: { userId: record.userId, isActive: true },
                 data: { isActive: false, revokedAt: new Date() },

@@ -415,6 +415,8 @@ model Credential {
   dataSourceDeclared   Boolean          @default(false)
   dataSourceDeclaredAt DateTime?
   dataSourceDeclaredIp String?
+  claimTokenHash       String?          @unique
+  claimTokenExpiresAt  DateTime?
   createdAt            DateTime         @default(now())
   updatedAt            DateTime         @updatedAt
 
