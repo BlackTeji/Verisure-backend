@@ -30,12 +30,18 @@ async function hashPwd(p: string): Promise<string> {
     return `${salt}:${key.toString('hex')}`
 }
 
+function serialiseCredential<T extends { blockNumber: bigint | null; claimTokenHash?: string | null; claimTokenExpiresAt?: Date | null }>(c: T) {
+    const { claimTokenHash, claimTokenExpiresAt, ...rest } = c
+    return {
+        ...rest,
+        blockNumber: c.blockNumber != null ? c.blockNumber.toString() : null,
+    }
+}
+
 export default async function holderRoutes(app: FastifyInstance) {
 
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireHolder)
-
-    // ── WALLET ────────────────────────────────────────────────────────────
 
     app.get('/me/credentials', async (req, reply) => {
         const query = z.object({
@@ -84,11 +90,14 @@ export default async function holderRoutes(app: FastifyInstance) {
         }
 
         const now = new Date()
-        const enriched = credentials.map(c => ({
-            ...c,
-            status: c.expiryDate && c.expiryDate < now && c.status === 'ACTIVE' ? 'EXPIRED' : c.status,
-            expiresInDays: c.expiryDate ? Math.ceil((c.expiryDate.getTime() - now.getTime()) / 86400000) : null,
-        }))
+        const enriched = credentials.map(c => {
+            const serialised = serialiseCredential(c)
+            return {
+                ...serialised,
+                status: c.expiryDate && c.expiryDate < now && c.status === 'ACTIVE' ? 'EXPIRED' : c.status,
+                expiresInDays: c.expiryDate ? Math.ceil((c.expiryDate.getTime() - now.getTime()) / 86400000) : null,
+            }
+        })
 
         return reply.status(200).send({ credentials: enriched })
     })
@@ -117,10 +126,8 @@ export default async function holderRoutes(app: FastifyInstance) {
             await db.credential.update({ where: { id }, data: { holderUserId: req.userId } })
         }
 
-        return reply.status(200).send({ credential: cred })
+        return reply.status(200).send({ credential: serialiseCredential(cred) })
     })
-
-    // ── SHARES ────────────────────────────────────────────────────────────
 
     app.get('/me/shares', async (req, reply) => {
         const profile = await db.holderProfile.findUnique({ where: { userId: req.userId! }, select: { id: true } })
@@ -199,8 +206,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Share revoked' })
     })
 
-    // ── SELF-VERIFY ───────────────────────────────────────────────────────
-
     app.get('/me/self-verify/:credentialId', async (req, reply) => {
         const { credentialId } = req.params as { credentialId: string }
         const user = await db.user.findUnique({ where: { id: req.userId! }, select: { email: true } })
@@ -218,8 +223,6 @@ export default async function holderRoutes(app: FastifyInstance) {
 
         return reply.status(200).send({ credentialId, verifyUrl: `${env.FRONTEND_URL}/verify?credential_id=${credentialId}` })
     })
-
-    // ── VERIFICATION HISTORY ──────────────────────────────────────────────
 
     app.get('/me/verifications', async (req, reply) => {
         const query = z.object({
@@ -258,8 +261,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         return reply.status(200).send({ logs, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
 
-    // ── PROFILE ───────────────────────────────────────────────────────────
-
     app.get('/me', async (req, reply) => {
         const user = await db.user.findUnique({
             where: { id: req.userId! },
@@ -279,8 +280,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         const user = await db.user.update({ where: { id: req.userId! }, data: body.data, select: { id: true, firstName: true, lastName: true, phone: true } })
         return reply.status(200).send({ user })
     })
-
-    // ── VERIFIED EMAIL ALIASES ────────────────────────────────────────────
 
     app.get('/me/aliases', async (req, reply) => {
         const aliases = await db.userEmailAlias.findMany({
@@ -327,7 +326,7 @@ export default async function holderRoutes(app: FastifyInstance) {
 
         const token = generateSecureToken()
         const tokenHash = sha256(token)
-        const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000) // 72hr TTL per TRD-VS-1.0
+        const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000)
 
         await db.userEmailAlias.upsert({
             where: { email: newEmail },
@@ -425,8 +424,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'Alias removed.' })
     })
 
-    // ── PASSWORD CHANGE ───────────────────────────────────────────────────
-
     app.patch('/me/password', async (req, reply) => {
         const body = z.object({
             currentPassword: z.string(),
@@ -447,8 +444,6 @@ export default async function holderRoutes(app: FastifyInstance) {
 
         return reply.status(200).send({ message: 'Password updated. Please log in again.' })
     })
-
-    // ── SESSIONS ──────────────────────────────────────────────────────────
 
     app.get('/me/sessions', async (req, reply) => {
         const sessions = await db.userSession.findMany({
@@ -472,8 +467,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         await revokeAllUserTokens(req.userId!)
         return reply.status(200).send({ message: 'All sessions revoked' })
     })
-
-    // ── 2FA ───────────────────────────────────────────────────────────────
 
     app.post('/me/2fa/setup', async (req, reply) => {
         const secret = generateTotpSecret()
@@ -506,8 +499,6 @@ export default async function holderRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: '2FA disabled' })
     })
 
-    // ── ACCOUNT DELETION ──────────────────────────────────────────────────
-
     app.delete('/me', async (req, reply) => {
         const body = z.object({ password: z.string() }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Password required to confirm deletion' })
@@ -535,8 +526,6 @@ export default async function holderRoutes(app: FastifyInstance) {
     })
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
-
 async function claimCredentialsForAlias(userId: string, email: string): Promise<number> {
     const unlinked = await db.credential.findMany({
         where: { holderEmail: email, holderUserId: null },
@@ -547,7 +536,7 @@ async function claimCredentialsForAlias(userId: string, email: string): Promise<
 
     await db.credential.updateMany({
         where: { id: { in: unlinked.map(c => c.id) } },
-        data: { holderUserId: userId },
+        data: { holderUserId: userId, claimTokenHash: null, claimTokenExpiresAt: null },
     })
 
     return unlinked.length
