@@ -9,8 +9,6 @@ export const QUEUES = {
     EXPIRY_SCHEDULER: 'vrs-expiry-scheduler',
 } as const
 
-// ── PAYLOADS ──────────────────────────────────────────────────
-
 export interface AnchorJobData {
     credentialId: string
     sha256Hash: string
@@ -28,6 +26,7 @@ export interface EmailJobData {
     | 'admin_notification'
     | 'new_device_alert'
     | 'bulk_complete'
+    | 'share_grant_created'
     to: string
     name?: string
     data: Record<string, unknown>
@@ -47,8 +46,6 @@ export interface WebhookJobData {
     payload: Record<string, unknown>
     attempt?: number
 }
-
-// ── QUEUES ────────────────────────────────────────────────────
 
 const conn = redis
 
@@ -90,8 +87,6 @@ export const webhookQueue = new Queue<WebhookJobData, any, string>(QUEUES.WEBHOO
         removeOnFail: { count: 2000 },
     },
 })
-
-// ── HEALTH ────────────────────────────────────────────────────
 
 export async function getQueueHealth() {
     const [a, e, b, w] = await Promise.all([

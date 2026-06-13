@@ -238,6 +238,23 @@ export const templates = {
         text: `New sign-in to your VeriSure account.\n\nTime: ${d.loginTime}\nIP: ${d.ipAddress}\nDevice: ${d.userAgent}\n\nIf this wasn't you, change your password immediately: ${d.accountUrl}`,
     }),
 
+    shareGrantCreated: (d: {
+        holderName: string
+        credentialType: string
+        issuerName: string
+        shareUrl: string
+        expiresAt: string | null
+    }) => ({
+        subject: `${d.holderName} shared a credential with you on VeriSure`,
+        html: wrap(`
+            <h1>A credential has been shared with you.</h1>
+            <p><strong>${d.holderName}</strong> has shared a <strong>${d.credentialType}</strong> credential issued by <strong>${d.issuerName}</strong> with you on VeriSure.</p>
+            <a href="${d.shareUrl}" class="btn">View shared credential →</a>
+            <p style="margin-top:20px;font-size:13px;color:#A8A49C">${d.expiresAt ? `This link expires on ${d.expiresAt}.` : 'This link does not expire unless revoked.'} The result is read-only and reflects the credential's current status, including any revocations.</p>
+        `),
+        text: `${d.holderName} shared a ${d.credentialType} credential issued by ${d.issuerName} with you on VeriSure.\n\nView it: ${d.shareUrl}\n\n${d.expiresAt ? `This link expires on ${d.expiresAt}.` : 'This link does not expire unless revoked.'}`,
+    }),
+
     bulkComplete: (d: {
         institutionName: string
         jobId: string

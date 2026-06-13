@@ -46,6 +46,9 @@ const worker = new Worker<EmailJobData>(
             case 'bulk_complete':
                 email = templates.bulkComplete(data as any)
                 break
+            case 'share_grant_created':
+                email = templates.shareGrantCreated(data as any)
+                break
             default:
                 logger.warn({ type }, 'email-worker: unknown email type — skipping')
                 return

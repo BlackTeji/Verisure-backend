@@ -157,7 +157,7 @@ export default async function holderRoutes(app: FastifyInstance) {
         }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { email: true } })
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { email: true, firstName: true, lastName: true } })
         const aliases = await db.userEmailAlias.findMany({
             where: { userId: req.userId!, verifiedAt: { not: null } },
             select: { email: true },
@@ -167,7 +167,13 @@ export default async function holderRoutes(app: FastifyInstance) {
         const profile = await db.holderProfile.findUnique({ where: { userId: req.userId! } })
         if (!profile) return reply.status(404).send({ error: 'Profile not found' })
 
-        const cred = await db.credential.findUnique({ where: { id: body.data.credentialId }, select: { id: true, holderUserId: true, holderEmail: true } })
+        const cred = await db.credential.findUnique({
+            where: { id: body.data.credentialId },
+            select: {
+                id: true, holderUserId: true, holderEmail: true, credentialType: true,
+                issuer: { select: { institutionName: true } },
+            },
+        })
         if (!cred) return reply.status(404).send({ error: 'Credential not found' })
         if (cred.holderUserId !== req.userId && !allEmails.includes(cred.holderEmail)) {
             return reply.status(403).send({ error: 'Forbidden' })
@@ -183,11 +189,28 @@ export default async function holderRoutes(app: FastifyInstance) {
             data: { credentialId: cred.id, holderId: profile.id, recipientEmail: body.data.recipientEmail ?? '', tokenHash, expiresAt },
         })
 
+        const shareUrl = `${env.FRONTEND_URL}/pages/verify.html?share_token=${token}`
+
+        if (body.data.recipientEmail) {
+            const holderName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.email || 'A VeriSure user'
+            await emailQueue.add('share_grant_created', {
+                type: 'share_grant_created',
+                to: body.data.recipientEmail,
+                data: {
+                    holderName,
+                    credentialType: cred.credentialType,
+                    issuerName: cred.issuer.institutionName,
+                    shareUrl,
+                    expiresAt: expiresAt ? expiresAt.toLocaleDateString('en-NG', { day: 'numeric', month: 'long', year: 'numeric' }) : null,
+                },
+            }).catch((e: any) => app.log.error({ err: e }, 'Share grant email failed'))
+        }
+
         audit({ action: 'SHARE_GRANT_CREATED', req, targetType: 'share_grant', targetId: grant.id })
 
         return reply.status(201).send({
             grantId: grant.id,
-            shareUrl: `${env.FRONTEND_URL}/verify?share_token=${token}`,
+            shareUrl,
             expiresAt,
         })
     })
@@ -221,7 +244,7 @@ export default async function holderRoutes(app: FastifyInstance) {
             return reply.status(403).send({ error: 'Forbidden' })
         }
 
-        return reply.status(200).send({ credentialId, verifyUrl: `${env.FRONTEND_URL}/verify?credential_id=${credentialId}` })
+        return reply.status(200).send({ credentialId, verifyUrl: `${env.FRONTEND_URL}/pages/verify.html?credential_id=${credentialId}` })
     })
 
     app.get('/me/verifications', async (req, reply) => {
