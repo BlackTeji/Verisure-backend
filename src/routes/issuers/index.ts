@@ -492,6 +492,61 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ credential: serialisable })
     })
 
+    app.get('/me/notifications', { preHandler: requireIssuer }, async (req, reply) => {
+        try {
+            const issuer = await db.issuerProfile.findUnique({
+                where: { userId: req.userId! },
+                select: { id: true },
+            })
+            if (!issuer) return reply.status(404).send({ error: 'Not found' })
+
+            const messages = await db.onboardingMessage.findMany({
+                where: { issuerId: issuer.id, direction: 'ADMIN_TO_ISSUER' },
+                orderBy: { createdAt: 'desc' },
+                take: 30,
+            })
+
+            const notifications = messages.map(m => ({
+                id: m.id,
+                type: 'ADMIN_NOTE',
+                title: 'Message from VeriSure review team',
+                body: m.body,
+                readAt: m.readAt,
+                createdAt: m.createdAt,
+            }))
+
+            const unreadCount = notifications.filter(n => !n.readAt).length
+
+            return reply.send({ notifications, unreadCount })
+        } catch (err) {
+            app.log.error({ err }, 'Get notifications error')
+            return reply.status(500).send({ error: 'Server error' })
+        }
+    })
+
+    app.post('/me/notifications/:id/read', { preHandler: requireIssuer }, async (req, reply) => {
+        try {
+            const { id } = req.params as { id: string }
+
+            const issuer = await db.issuerProfile.findUnique({
+                where: { userId: req.userId! },
+                select: { id: true },
+            })
+            if (!issuer) return reply.status(404).send({ error: 'Not found' })
+
+            await db.onboardingMessage.updateMany({
+                where: { id, issuerId: issuer.id },
+                data: { readAt: new Date() },
+            })
+
+            return reply.send({ ok: true })
+        } catch (err) {
+            app.log.error({ err }, 'Mark notification read error')
+            return reply.status(500).send({ error: 'Server error' })
+        }
+    })
+
+
     // ── ANALYTICS ────────────────────────────────────────────────────────────────
 
     app.get('/me/analytics', { preHandler: requireApprovedIssuer }, async (req, reply) => {
@@ -782,7 +837,10 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const [logs, total] = await db.$transaction([
             db.verificationLog.findMany({
                 where: { credential: { issuerId: req.issuerId! } },
-                include: { credential: { select: { credentialType: true, holderName: true } } },
+                include: {
+                    credential: { select: { credentialType: true, holderName: true } },
+                    verifier: { select: { organisationName: true } },
+                },
                 orderBy: { verifiedAt: 'desc' },
                 skip: (page - 1) * limit,
                 take: limit,

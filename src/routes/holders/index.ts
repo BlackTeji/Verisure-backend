@@ -273,7 +273,10 @@ export default async function holderRoutes(app: FastifyInstance) {
         const [logs, total] = await db.$transaction([
             db.verificationLog.findMany({
                 where: { credentialId: { in: ids } },
-                include: { credential: { select: { credentialType: true, issuer: { select: { institutionName: true } } } } },
+                include: {
+                    credential: { select: { credentialType: true, issuer: { select: { institutionName: true } } } },
+                    verifier: { select: { organisationName: true } },
+                },
                 orderBy: { verifiedAt: 'desc' },
                 skip: (page - 1) * limit,
                 take: limit,

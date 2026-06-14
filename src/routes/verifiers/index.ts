@@ -256,14 +256,32 @@ export default async function verifierRoutes(app: FastifyInstance) {
 
     // ── VERIFICATION HISTORY ────────────────────────────────────────────
     app.get('/me/verifications', async (req, reply) => {
-        const query = z.object({ page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25), result: z.enum(['ACTIVE', 'REVOKED', 'FROZEN', 'EXPIRED']).optional(), method: z.enum(['DASHBOARD', 'QR_SCAN', 'API', 'BULK_CSV']).optional() }).safeParse(req.query)
+        const query = z.object({
+            page: z.coerce.number().int().min(1).default(1),
+            limit: z.coerce.number().int().min(1).max(100).default(25),
+            result: z.enum(['ACTIVE', 'REVOKED', 'FROZEN', 'EXPIRED']).optional(),
+            method: z.enum(['DASHBOARD', 'QR_SCAN', 'API', 'BULK_CSV']).optional(),
+        }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
 
         const { page, limit, result, method } = query.data
-        const where: any = { verifierId: req.verifierId!, ...(result ? { result } : {}), ...(method ? { method } : {}) }
+        const where: any = {
+            verifierId: req.verifierId!,
+            ...(result ? { result } : {}),
+            ...(method ? { method } : {}),
+        }
 
         const [logs, total] = await db.$transaction([
-            db.verificationLog.findMany({ where, include: { credential: { select: { credentialType: true, holderName: true, issuer: { select: { institutionName: true } } } } }, orderBy: { verifiedAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
+            db.verificationLog.findMany({
+                where,
+                include: {
+                    credential: { select: { credentialType: true, holderName: true, issuer: { select: { institutionName: true } } } },
+                    apiKey: { select: { name: true, environment: true } },
+                },
+                orderBy: { verifiedAt: 'desc' },
+                skip: (page - 1) * limit,
+                take: limit,
+            }),
             db.verificationLog.count({ where }),
         ])
 

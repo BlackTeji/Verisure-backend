@@ -260,7 +260,7 @@ export default async function authRoutes(app: FastifyInstance) {
                         loginTime,
                         accountUrl: `${env.FRONTEND_URL}/pages/login.html`,
                     },
-                }).catch(() => { /* alert failure must never break login */ })
+                }).catch(() => { })
             }
 
             const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
@@ -353,8 +353,17 @@ export default async function authRoutes(app: FastifyInstance) {
             if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
 
             const record = await db.emailVerificationToken.findUnique({ where: { tokenHash: sha256(token) } })
-            if (!record || record.usedAt || record.expiresAt < new Date()) {
-                return reply.status(400).send({ error: 'Bad request', message: 'Invalid or expired link' })
+
+            if (!record) {
+                return reply.status(410).send({ error: 'Gone', message: 'Invalid or expired link' })
+            }
+
+            if (record.usedAt) {
+                return reply.status(410).send({ error: 'Gone', message: 'This link has already been used' })
+            }
+
+            if (record.expiresAt < new Date()) {
+                return reply.status(410).send({ error: 'Gone', message: 'This verification link has expired' })
             }
 
             await db.$transaction([
