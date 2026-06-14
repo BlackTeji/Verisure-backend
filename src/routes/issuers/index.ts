@@ -15,6 +15,64 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 const scryptAsync = promisify(scrypt)
 
+// ── MAGIC BYTE SIGNATURES ────────────────────────────────────────────────────
+// These are the only trusted file-type checks. The browser-supplied MIME type
+// is untrusted input and is NOT used for security decisions.
+
+interface MagicEntry {
+    bytes: number[]      // expected bytes at offset
+    offset: number       // byte offset to check from
+    mime: string         // canonical MIME type to assign
+    ext: string          // human-readable extension label
+}
+
+const MAGIC_SIGNATURES: MagicEntry[] = [
+    // PDF — %PDF
+    { bytes: [0x25, 0x50, 0x44, 0x46], offset: 0, mime: 'application/pdf', ext: 'pdf' },
+    // PNG — \x89PNG
+    { bytes: [0x89, 0x50, 0x4E, 0x47], offset: 0, mime: 'image/png', ext: 'png' },
+    // JPEG — \xFF\xD8\xFF
+    { bytes: [0xFF, 0xD8, 0xFF], offset: 0, mime: 'image/jpeg', ext: 'jpg' },
+    // SVG — starts with '<' (0x3C) after optional BOM, or '<?xml'
+    // Detected by text content check below, not magic bytes
+]
+
+/**
+ * Detect file type from magic bytes.
+ * Returns the canonical MIME type, or null if unrecognised.
+ */
+function detectFileType(buf: Buffer): { mime: string; ext: string } | null {
+    for (const sig of MAGIC_SIGNATURES) {
+        if (buf.length < sig.offset + sig.bytes.length) continue
+        const match = sig.bytes.every((b, i) => buf[sig.offset + i] === b)
+        if (match) return { mime: sig.mime, ext: sig.ext }
+    }
+
+    // SVG detection — text-based, no fixed magic bytes
+    // Check first 512 bytes for <svg or <?xml markers
+    const head = buf.slice(0, 512).toString('utf8', 0, Math.min(512, buf.length))
+    const stripped = head.replace(/^\uFEFF/, '').trimStart() // strip BOM and whitespace
+    if (
+        stripped.startsWith('<svg') ||
+        stripped.startsWith('<?xml') ||
+        stripped.includes('<svg ')
+    ) {
+        return { mime: 'image/svg+xml', ext: 'svg' }
+    }
+
+    return null
+}
+
+const ALLOWED_DOC_TYPES: Record<string, string[]> = {
+    // documentType enum value → allowed MIME types from magic detection
+    CAC_CERTIFICATE: ['application/pdf'],
+    NUC_ACCREDITATION: ['application/pdf'],
+    PROFESSIONAL_CHARTER: ['application/pdf'],
+    LETTER_OF_AUTHORITY: ['application/pdf'],
+    CREDENTIAL_SPECIMEN: ['application/pdf'],
+    LOGO: ['image/png', 'image/jpeg', 'image/svg+xml'],
+}
+
 export default async function issuerRoutes(app: FastifyInstance) {
 
     app.get('/public', async (request, reply) => {
@@ -254,6 +312,11 @@ export default async function issuerRoutes(app: FastifyInstance) {
     })
 
     // ── ONBOARDING — DOCUMENT UPLOAD ────────────────────────────────────────────
+    //
+    // SECURITY NOTE: The browser-supplied Content-Type / mimetype is UNTRUSTED.
+    // Chrome on Windows frequently sends PDFs as application/octet-stream.
+    // All file-type decisions are made from magic bytes only. The browser MIME
+    // type is ignored for security purposes and only used as a logging hint.
 
     app.post('/onboarding/documents', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
@@ -262,6 +325,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const data = await (req as any).file()
         if (!data) return reply.status(400).send({ error: 'Validation error', message: 'No file received.' })
 
+        // ── Document type validation ──────────────────────────────────────────
         const docType = data.fields?.documentType?.value ?? data.fields?.documentType
         const validDocTypes = [
             'CAC_CERTIFICATE', 'NUC_ACCREDITATION', 'PROFESSIONAL_CHARTER',
@@ -274,36 +338,66 @@ export default async function issuerRoutes(app: FastifyInstance) {
             })
         }
 
-        const allowedMimes = ['application/pdf', 'image/jpeg', 'image/png', 'image/svg+xml']
-        if (!allowedMimes.includes(data.mimetype ?? '')) {
-            return reply.status(400).send({
-                error: 'Validation error',
-                message: 'Only PDF, JPG, PNG, and SVG files are accepted.',
-            })
-        }
-
+        // ── Read file into buffer (enforce 5 MB limit while streaming) ────────
         const MAX_SIZE = 5 * 1024 * 1024
         const chunks: Buffer[] = []
         let totalSize = 0
         for await (const chunk of data.file) {
             totalSize += chunk.length
             if (totalSize > MAX_SIZE) {
+                // Drain remaining stream to avoid socket issues
+                data.file.resume?.()
                 return reply.status(413).send({ error: 'File too large', message: 'Maximum file size is 5 MB.' })
             }
             chunks.push(chunk)
         }
 
-        const fileBuffer = Buffer.concat(chunks)
-        const filename = data.filename ?? `document-${Date.now()}`
+        if (totalSize === 0) {
+            return reply.status(400).send({ error: 'Validation error', message: 'File is empty.' })
+        }
 
+        const fileBuffer = Buffer.concat(chunks)
+
+        // ── Magic byte file type detection (authoritative) ────────────────────
+        const detected = detectFileType(fileBuffer)
+        if (!detected) {
+            return reply.status(415).send({
+                error: 'UnsupportedMediaType',
+                message: 'File type not recognised. Accepted formats: PDF (for documents), PNG, JPG, or SVG (for logo).',
+            })
+        }
+
+        // ── Per-document-type MIME enforcement ────────────────────────────────
+        const allowedForType = ALLOWED_DOC_TYPES[docType] ?? []
+        if (!allowedForType.includes(detected.mime)) {
+            const friendly: Record<string, string> = {
+                CAC_CERTIFICATE: 'PDF only',
+                NUC_ACCREDITATION: 'PDF only',
+                PROFESSIONAL_CHARTER: 'PDF only',
+                LETTER_OF_AUTHORITY: 'PDF only',
+                CREDENTIAL_SPECIMEN: 'PDF only',
+                LOGO: 'PNG, JPG, or SVG only',
+            }
+            return reply.status(415).send({
+                error: 'UnsupportedMediaType',
+                message: `${docType} requires: ${friendly[docType] ?? 'PDF'}. Received: ${detected.ext.toUpperCase()}.`,
+            })
+        }
+
+        // ── Use detected MIME type (not browser-supplied) for storage ─────────
+        const canonicalMime = detected.mime
+        const filename = data.filename ?? `document-${Date.now()}.${detected.ext}`
+
+        // ── Upload to object storage ──────────────────────────────────────────
         let storageKey: string
         try {
-            storageKey = await uploadToS3(fileBuffer, filename, data.mimetype, profile.id)
+            storageKey = await uploadToS3(fileBuffer, filename, canonicalMime, profile.id)
         } catch (e: any) {
             app.log.error({ err: e }, 'Document upload to S3 failed')
             return reply.status(500).send({ error: 'Storage error', message: 'Upload failed. Please try again.' })
         }
 
+        // ── Upsert document record (one record per docType per issuer) ────────
         const doc = await db.issuerDocument.upsert({
             where: { issuerId_documentType: { issuerId: profile.id, documentType: docType as any } },
             create: {
@@ -311,7 +405,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 documentType: docType as any,
                 filename,
                 storageKey,
-                mimeType: data.mimetype,
+                mimeType: canonicalMime,
                 fileSizeBytes: totalSize,
                 reviewStatus: 'PENDING',
                 virusScanStatus: 'PENDING',
@@ -319,7 +413,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             update: {
                 filename,
                 storageKey,
-                mimeType: data.mimetype,
+                mimeType: canonicalMime,
                 fileSizeBytes: totalSize,
                 reviewStatus: 'PENDING',
                 virusScanStatus: 'PENDING',
@@ -334,7 +428,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             req,
             targetType: 'issuer_document',
             targetId: doc.id,
-            metadata: { documentType: docType, filename, fileSizeBytes: totalSize },
+            metadata: { documentType: docType, filename, fileSizeBytes: totalSize, detectedMime: canonicalMime },
         })
 
         return reply.status(201).send({
@@ -559,7 +653,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const from = new Date(Date.now() - days * 86400000)
         const issuerId = req.issuerId!
 
-        // ── CORE METRICS (unchanged) ──────────────────────────────────────────
+        // ── CORE METRICS ──────────────────────────────────────────────────────
         const [
             totalIssued,
             totalVerifications,
@@ -584,8 +678,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             db.credential.count({ where: { issuerId, txHash: null, status: { not: 'REVOKED' } } }),
         ])
 
-        // ── REACH METRICS — holder-driven signals ─────────────────────────────
-
+        // ── REACH METRICS ─────────────────────────────────────────────────────
         const [
             totalShares,
             sharesInPeriod,
@@ -594,47 +687,18 @@ export default async function issuerRoutes(app: FastifyInstance) {
             unclaimedCredentials,
             geoReach,
         ] = await Promise.all([
-
-            db.shareGrant.count({
-                where: { credential: { issuerId } },
-            }),
-
-            db.shareGrant.count({
-                where: { credential: { issuerId }, createdAt: { gte: from } },
-            }),
-
-            db.verificationLog.count({
-                where: {
-                    credential: { issuerId },
-                    method: { in: ['QR_SCAN', 'SELF_VERIFY'] },
-                },
-            }),
-
-            db.verificationLog.count({
-                where: {
-                    credential: { issuerId },
-                    method: { in: ['QR_SCAN', 'SELF_VERIFY'] },
-                    verifiedAt: { gte: from },
-                },
-            }),
-
-            db.credential.count({
-                where: { issuerId, holderUserId: null, status: { not: 'REVOKED' } },
-            }),
-
-            db.verificationLog.groupBy({
-                by: ['country'],
-                where: { credential: { issuerId }, country: { not: null } },
-                _count: true,
-                orderBy: { _count: { country: 'desc' } },
-                take: 1,
-            }),
+            db.shareGrant.count({ where: { credential: { issuerId } } }),
+            db.shareGrant.count({ where: { credential: { issuerId }, createdAt: { gte: from } } }),
+            db.verificationLog.count({ where: { credential: { issuerId }, method: { in: ['QR_SCAN', 'SELF_VERIFY'] } } }),
+            db.verificationLog.count({ where: { credential: { issuerId }, method: { in: ['QR_SCAN', 'SELF_VERIFY'] }, verifiedAt: { gte: from } } }),
+            db.credential.count({ where: { issuerId, holderUserId: null, status: { not: 'REVOKED' } } }),
+            db.verificationLog.groupBy({ by: ['country'], where: { credential: { issuerId }, country: { not: null } }, _count: true, orderBy: { _count: { country: 'desc' } }, take: 1 }),
         ])
 
         const countriesReached = geo.length
         const topCountry = geoReach[0]?.country ?? null
 
-        // ── VERIFIER NAME RESOLUTION (unchanged) ──────────────────────────────
+        // ── VERIFIER NAME RESOLUTION ──────────────────────────────────────────
         const verifierIds = topVerifiers.map(v => v.verifierId!).filter(Boolean)
         const verifierProfiles = await db.verifierProfile.findMany({
             where: { id: { in: verifierIds } },
@@ -656,7 +720,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 revocationRate: totalIssued > 0 ? ((revoked / totalIssued) * 100).toFixed(2) + '%' : '0%',
                 pendingAnchor: anchorPending,
             },
-
             reach: {
                 totalShares,
                 sharesInPeriod,
@@ -870,7 +933,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
         await db.user.update({ where: { id: req.userId! }, data: { passwordHash: await hashPwd(body.data.newPassword), failedLoginCount: 0 } })
         await revokeAllUserTokens(req.userId!)
 
-        // Revoke all active sessions — password change invalidates everything
         await db.userSession.updateMany({
             where: { userId: req.userId!, isActive: true },
             data: { isActive: false, revokedAt: new Date() },
