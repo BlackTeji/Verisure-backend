@@ -358,6 +358,8 @@ export default async function issuerRoutes(app: FastifyInstance) {
 
         const fileBuffer = Buffer.concat(chunks)
 
+        app.log.info({ firstBytes: fileBuffer.slice(0, 8).toString('hex'), totalSize, browserMime: data.mimetype }, 'document upload received')
+
         // ── Magic byte file type detection (authoritative) ────────────────────
         const detected = detectFileType(fileBuffer)
         if (!detected) {
