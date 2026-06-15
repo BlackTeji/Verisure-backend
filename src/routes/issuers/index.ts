@@ -11,45 +11,8 @@ import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
 import { createCipheriv, createHash, createHmac, randomBytes, scrypt } from 'node:crypto'
 import { promisify } from 'node:util'
-import { request as httpsRequest } from 'node:https'
 
 const scryptAsync = promisify(scrypt)
-
-interface MagicEntry {
-    bytes: number[]
-    offset: number
-    mime: string
-    ext: string
-}
-
-const MAGIC_SIGNATURES: MagicEntry[] = [
-    { bytes: [0x25, 0x50, 0x44, 0x46], offset: 0, mime: 'application/pdf', ext: 'pdf' },
-    { bytes: [0x89, 0x50, 0x4E, 0x47], offset: 0, mime: 'image/png', ext: 'png' },
-    { bytes: [0xFF, 0xD8, 0xFF], offset: 0, mime: 'image/jpeg', ext: 'jpg' },
-]
-
-function detectFileType(buf: Buffer): { mime: string; ext: string } | null {
-    for (const sig of MAGIC_SIGNATURES) {
-        if (buf.length < sig.offset + sig.bytes.length) continue
-        const match = sig.bytes.every((b, i) => buf[sig.offset + i] === b)
-        if (match) return { mime: sig.mime, ext: sig.ext }
-    }
-    const head = buf.slice(0, 512).toString('utf8', 0, Math.min(512, buf.length))
-    const stripped = head.replace(/^\uFEFF/, '').trimStart()
-    if (stripped.startsWith('<svg') || stripped.startsWith('<?xml') || stripped.includes('<svg ')) {
-        return { mime: 'image/svg+xml', ext: 'svg' }
-    }
-    return null
-}
-
-const ALLOWED_DOC_TYPES: Record<string, string[]> = {
-    CAC_CERTIFICATE: ['application/pdf'],
-    NUC_ACCREDITATION: ['application/pdf'],
-    PROFESSIONAL_CHARTER: ['application/pdf'],
-    LETTER_OF_AUTHORITY: ['application/pdf'],
-    CREDENTIAL_SPECIMEN: ['application/pdf'],
-    LOGO: ['image/png', 'image/jpeg', 'image/svg+xml'],
-}
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
@@ -202,95 +165,82 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ success: true, message: 'Step 2 saved.' })
     })
 
-    app.post('/onboarding/documents', async (req, reply) => {
+    app.post('/onboarding/documents/presign', async (req, reply) => {
+        const body = z.object({
+            documentType: z.enum(['CAC_CERTIFICATE', 'NUC_ACCREDITATION', 'PROFESSIONAL_CHARTER', 'LETTER_OF_AUTHORITY', 'CREDENTIAL_SPECIMEN', 'LOGO']),
+            filename: z.string().min(1).max(200),
+            fileSize: z.number().int().min(1).max(5 * 1024 * 1024),
+            mimeType: z.string().min(1).max(100),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
+
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
-        if (!profile) return reply.status(404).send({ error: 'Not found', message: 'Issuer profile not found.' })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
 
-        const validDocTypes = [
-            'CAC_CERTIFICATE', 'NUC_ACCREDITATION', 'PROFESSIONAL_CHARTER',
-            'LETTER_OF_AUTHORITY', 'CREDENTIAL_SPECIMEN', 'LOGO',
-        ]
+        const { documentType, filename, mimeType } = body.data
+        const storageKey = `onboarding/${profile.id}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
 
-        let docType: string | null = null
-        let fileBuffer: Buffer | null = null
-        let filename: string = `document-${Date.now()}`
-        let totalSize = 0
-        const MAX_SIZE = 5 * 1024 * 1024
+        const bucket = env.S3_BUCKET ?? ''
+        const region = env.S3_REGION ?? 'auto'
+        const endpoint = env.S3_ENDPOINT ?? ''
+        const accessKeyId = env.S3_ACCESS_KEY_ID ?? ''
+        const secretAccessKey = env.S3_SECRET_ACCESS_KEY ?? ''
 
-        for await (const part of (req as any).parts()) {
-            if (part.type === 'field' && part.fieldname === 'documentType') {
-                docType = String(part.value ?? '').trim()
-                continue
-            }
-            if (part.type === 'file' && part.fieldname === 'file') {
-                filename = part.filename ?? filename
-                const chunks: Buffer[] = []
-                for await (const chunk of part.file) {
-                    totalSize += chunk.length
-                    if (totalSize > MAX_SIZE) {
-                        part.file.resume?.()
-                        return reply.status(413).send({ error: 'File too large', message: 'Maximum file size is 5 MB.' })
-                    }
-                    chunks.push(chunk)
-                }
-                fileBuffer = Buffer.concat(chunks)
-                continue
-            }
-            if (part.file) part.file.resume?.()
-        }
+        const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z'
+        const date = datetime.slice(0, 8)
+        const credentialScope = `${date}/${region}/s3/aws4_request`
 
-        if (!docType || !validDocTypes.includes(docType)) {
-            return reply.status(400).send({
-                error: 'Validation error',
-                message: `documentType must be one of: ${validDocTypes.join(', ')}`,
-            })
-        }
+        const params = new URLSearchParams({
+            'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+            'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
+            'X-Amz-Date': datetime,
+            'X-Amz-Expires': '300',
+            'X-Amz-SignedHeaders': 'content-type;host',
+        })
 
-        if (!fileBuffer || totalSize === 0) {
-            return reply.status(400).send({ error: 'Validation error', message: 'No file received.' })
-        }
+        const host = new URL(endpoint).host
+        const canonicalUri = `/${bucket}/${storageKey}`
+        const canonicalHeaders = `content-type:${mimeType}\nhost:${host}\n`
+        const canonicalRequest = ['PUT', canonicalUri, params.toString(), canonicalHeaders, 'content-type;host', 'UNSIGNED-PAYLOAD'].join('\n')
+        const stringToSign = ['AWS4-HMAC-SHA256', datetime, credentialScope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
 
-        const detected = detectFileType(fileBuffer)
-        if (!detected) {
-            return reply.status(415).send({
-                error: 'UnsupportedMediaType',
-                message: 'File type not recognised. Accepted formats: PDF (for documents), PNG, JPG, or SVG (for logo).',
-            })
-        }
+        const hmac = (k: Buffer | string, d: string) => createHmac('sha256', k).update(d).digest()
+        const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, date), region), 's3'), 'aws4_request')
+        const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex')
+        params.set('X-Amz-Signature', signature)
 
-        const allowedForType = ALLOWED_DOC_TYPES[docType] ?? []
-        if (!allowedForType.includes(detected.mime)) {
-            const friendly: Record<string, string> = {
-                CAC_CERTIFICATE: 'PDF only', NUC_ACCREDITATION: 'PDF only',
-                PROFESSIONAL_CHARTER: 'PDF only', LETTER_OF_AUTHORITY: 'PDF only',
-                CREDENTIAL_SPECIMEN: 'PDF only', LOGO: 'PNG, JPG, or SVG only',
-            }
-            return reply.status(415).send({
-                error: 'UnsupportedMediaType',
-                message: `${docType} requires: ${friendly[docType] ?? 'PDF'}. Received: ${detected.ext.toUpperCase()}.`,
-            })
-        }
+        const presignedUrl = `${endpoint}/${bucket}/${storageKey}?${params.toString()}`
+        return reply.status(200).send({ presignedUrl, storageKey, documentType })
+    })
 
-        const canonicalMime = detected.mime
-        if (!filename.includes('.')) filename = `${filename}.${detected.ext}`
+    app.post('/onboarding/documents/confirm', async (req, reply) => {
+        const body = z.object({
+            documentType: z.enum(['CAC_CERTIFICATE', 'NUC_ACCREDITATION', 'PROFESSIONAL_CHARTER', 'LETTER_OF_AUTHORITY', 'CREDENTIAL_SPECIMEN', 'LOGO']),
+            storageKey: z.string().min(1),
+            filename: z.string().min(1),
+            mimeType: z.string().min(1),
+            fileSize: z.number().int().min(1),
+        }).safeParse(req.body)
+        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
 
-        let storageKey: string
-        try {
-            storageKey = await uploadToS3(fileBuffer, filename, canonicalMime, profile.id)
-        } catch (e: any) {
-            app.log.error({ err: e }, 'Document upload to S3 failed')
-            return reply.status(500).send({ error: 'Storage error', message: 'Upload failed. Please try again.' })
+        const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
+        if (!profile) return reply.status(404).send({ error: 'Not found' })
+
+        if (!body.data.storageKey.startsWith(`onboarding/${profile.id}/`)) {
+            return reply.status(403).send({ error: 'Forbidden', message: 'Storage key does not belong to this issuer.' })
         }
 
         const doc = await db.issuerDocument.upsert({
-            where: { issuerId_documentType: { issuerId: profile.id, documentType: docType as any } },
+            where: { issuerId_documentType: { issuerId: profile.id, documentType: body.data.documentType } },
             create: {
-                issuerId: profile.id, documentType: docType as any, filename,
-                storageKey, mimeType: canonicalMime, fileSizeBytes: totalSize,
+                issuerId: profile.id, documentType: body.data.documentType,
+                filename: body.data.filename, storageKey: body.data.storageKey,
+                mimeType: body.data.mimeType, fileSizeBytes: body.data.fileSize,
                 reviewStatus: 'PENDING', virusScanStatus: 'PENDING',
             },
             update: {
-                filename, storageKey, mimeType: canonicalMime, fileSizeBytes: totalSize,
+                filename: body.data.filename, storageKey: body.data.storageKey,
+                mimeType: body.data.mimeType, fileSizeBytes: body.data.fileSize,
                 reviewStatus: 'PENDING', virusScanStatus: 'PENDING',
                 reviewedAt: null, reviewedById: null, reviewNote: null,
             },
@@ -299,7 +249,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         audit({
             action: 'ONBOARDING_DOCUMENT_UPLOADED', req,
             targetType: 'issuer_document', targetId: doc.id,
-            metadata: { documentType: docType, filename, fileSizeBytes: totalSize, detectedMime: canonicalMime },
+            metadata: { documentType: body.data.documentType, filename: body.data.filename, fileSizeBytes: body.data.fileSize },
         })
 
         return reply.status(201).send({
@@ -728,67 +678,4 @@ function encryptAES(plaintext: string): string {
     const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
     const tag = cipher.getAuthTag()
     return iv.toString('hex') + tag.toString('hex') + encrypted.toString('hex')
-}
-
-async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
-    const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-    const bucket = env.S3_BUCKET ?? ''
-    const region = env.S3_REGION ?? 'auto'
-    const endpoint = env.S3_ENDPOINT ?? ''
-    const accessKeyId = env.S3_ACCESS_KEY_ID ?? ''
-    const secretAccessKey = env.S3_SECRET_ACCESS_KEY ?? ''
-
-    const endpointUrl = new URL(`/${bucket}/${key}`, endpoint)
-    const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z'
-    const date = datetime.slice(0, 8)
-    const payloadHash = createHash('sha256').update(fileBuffer).digest('hex')
-
-    const headers: Record<string, string> = {
-        'content-type': mimeType,
-        'content-length': String(fileBuffer.length),
-        'host': endpointUrl.host,
-        'x-amz-content-sha256': payloadHash,
-        'x-amz-date': datetime,
-        'x-amz-server-side-encryption': 'AES256',
-    }
-
-    const sortedKeys = Object.keys(headers).sort()
-    const signedHeaders = sortedKeys.join(';')
-    const canonicalHeaders = sortedKeys.map(k => `${k}:${headers[k]}`).join('\n') + '\n'
-    const canonicalRequest = ['PUT', endpointUrl.pathname, '', canonicalHeaders, signedHeaders, payloadHash].join('\n')
-    const credentialScope = `${date}/${region}/s3/aws4_request`
-    const stringToSign = ['AWS4-HMAC-SHA256', datetime, credentialScope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
-
-    const hmac = (k: Buffer | string, d: string) => createHmac('sha256', k).update(d).digest()
-    const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, date), region), 's3'), 'aws4_request')
-    const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex')
-    headers['authorization'] = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
-
-    await new Promise<void>((resolve, reject) => {
-        const req = httpsRequest(
-            {
-                hostname: endpointUrl.hostname,
-                path: endpointUrl.pathname,
-                method: 'PUT',
-                headers,
-                rejectUnauthorized: false,
-            },
-            (res: any) => {
-                const chunks: Buffer[] = []
-                res.on('data', (c: Buffer) => chunks.push(c))
-                res.on('end', () => {
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                        resolve()
-                    } else {
-                        reject(new Error(`R2 upload failed: ${res.statusCode} ${Buffer.concat(chunks).toString()}`))
-                    }
-                })
-            }
-        )
-        req.on('error', reject)
-        req.write(fileBuffer)
-        req.end()
-    })
-
-    return key
 }
