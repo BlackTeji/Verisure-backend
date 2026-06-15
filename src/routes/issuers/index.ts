@@ -15,56 +15,34 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 const scryptAsync = promisify(scrypt)
 
-// ── MAGIC BYTE SIGNATURES ────────────────────────────────────────────────────
-// These are the only trusted file-type checks. The browser-supplied MIME type
-// is untrusted input and is NOT used for security decisions.
-
 interface MagicEntry {
-    bytes: number[]      // expected bytes at offset
-    offset: number       // byte offset to check from
-    mime: string         // canonical MIME type to assign
-    ext: string          // human-readable extension label
+    bytes: number[]
+    offset: number
+    mime: string
+    ext: string
 }
 
 const MAGIC_SIGNATURES: MagicEntry[] = [
-    // PDF — %PDF
     { bytes: [0x25, 0x50, 0x44, 0x46], offset: 0, mime: 'application/pdf', ext: 'pdf' },
-    // PNG — \x89PNG
     { bytes: [0x89, 0x50, 0x4E, 0x47], offset: 0, mime: 'image/png', ext: 'png' },
-    // JPEG — \xFF\xD8\xFF
     { bytes: [0xFF, 0xD8, 0xFF], offset: 0, mime: 'image/jpeg', ext: 'jpg' },
-    // SVG — starts with '<' (0x3C) after optional BOM, or '<?xml'
-    // Detected by text content check below, not magic bytes
 ]
 
-/**
- * Detect file type from magic bytes.
- * Returns the canonical MIME type, or null if unrecognised.
- */
 function detectFileType(buf: Buffer): { mime: string; ext: string } | null {
     for (const sig of MAGIC_SIGNATURES) {
         if (buf.length < sig.offset + sig.bytes.length) continue
         const match = sig.bytes.every((b, i) => buf[sig.offset + i] === b)
         if (match) return { mime: sig.mime, ext: sig.ext }
     }
-
-    // SVG detection — text-based, no fixed magic bytes
-    // Check first 512 bytes for <svg or <?xml markers
     const head = buf.slice(0, 512).toString('utf8', 0, Math.min(512, buf.length))
-    const stripped = head.replace(/^\uFEFF/, '').trimStart() // strip BOM and whitespace
-    if (
-        stripped.startsWith('<svg') ||
-        stripped.startsWith('<?xml') ||
-        stripped.includes('<svg ')
-    ) {
+    const stripped = head.replace(/^\uFEFF/, '').trimStart()
+    if (stripped.startsWith('<svg') || stripped.startsWith('<?xml') || stripped.includes('<svg ')) {
         return { mime: 'image/svg+xml', ext: 'svg' }
     }
-
     return null
 }
 
 const ALLOWED_DOC_TYPES: Record<string, string[]> = {
-    // documentType enum value → allowed MIME types from magic detection
     CAC_CERTIFICATE: ['application/pdf'],
     NUC_ACCREDITATION: ['application/pdf'],
     PROFESSIONAL_CHARTER: ['application/pdf'],
@@ -84,59 +62,26 @@ export default async function issuerRoutes(app: FastifyInstance) {
         }).safeParse(request.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
         const { page, limit, search, type } = query.data
-
-        const skip = (page - 1) * limit;
-
-        const where: any = { status: 'APPROVED' };
-
-        if (search?.trim()) {
-            where.institutionName = {
-                contains: search.trim(),
-                mode: 'insensitive',
-            };
-        }
-
-        if (type?.trim()) {
-            where.institutionType = type.trim();
-        }
-
+        const skip = (page - 1) * limit
+        const where: any = { status: 'APPROVED' }
+        if (search?.trim()) where.institutionName = { contains: search.trim(), mode: 'insensitive' }
+        if (type?.trim()) where.institutionType = type.trim()
         const [issuers, total] = await Promise.all([
             db.issuerProfile.findMany({
-                where,
-                skip,
-                take: limit,
-                orderBy: { approvedAt: 'desc' },
+                where, skip, take: limit, orderBy: { approvedAt: 'desc' },
                 select: {
-                    id: true,
-                    institutionName: true,
-                    institutionType: true,
-                    websiteUrl: true,
-                    logoUrl: true,
-                    approvedAt: true,
-                    _count: {
-                        select: { credentials: true },
-                    },
+                    id: true, institutionName: true, institutionType: true,
+                    websiteUrl: true, logoUrl: true, approvedAt: true,
+                    _count: { select: { credentials: true } },
                 },
             }),
             db.issuerProfile.count({ where }),
-        ]);
-
-        return reply.send({
-            issuers,
-            pagination: {
-                page,
-                limit,
-                total,
-                pages: Math.ceil(total / limit),
-            },
-        });
-    }
-    );
+        ])
+        return reply.send({ issuers, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
+    })
 
     app.addHook('preHandler', authenticate)
     app.addHook('preHandler', requireIssuer)
-
-    // ── PROFILE ─────────────────────────────────────────────────────────────────
 
     app.get('/me', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({
@@ -147,44 +92,20 @@ export default async function issuerRoutes(app: FastifyInstance) {
                     select: { id: true, customDomain: true, displayName: true, isLive: true, dnsVerified: true },
                 },
                 documents: {
-                    select: {
-                        id: true,
-                        documentType: true,
-                        filename: true,
-                        reviewStatus: true,
-                        reviewNote: true,
-                        uploadedAt: true,
-                    },
+                    select: { id: true, documentType: true, filename: true, reviewStatus: true, reviewNote: true, uploadedAt: true },
                     orderBy: { uploadedAt: 'asc' },
                 },
                 messages: {
                     where: { direction: 'ADMIN_TO_ISSUER' },
-                    select: {
-                        id: true,
-                        direction: true,
-                        body: true,
-                        readAt: true,
-                        createdAt: true,
-                    },
+                    select: { id: true, direction: true, body: true, readAt: true, createdAt: true },
                     orderBy: { createdAt: 'asc' },
                 },
             },
         })
         if (!profile) return reply.status(404).send({ error: 'Not found' })
-
-        const safeProfile = {
-            ...profile,
-            signatoryNin: profile.signatoryNin ? 'XXX-XXXX-XXXXX' : null,
-        }
-
-        const user = await db.user.findUnique({
-            where: { id: req.userId! },
-            select: { twoFactorEnabled: true },
-        })
-
-        return reply.status(200).send({
-            profile: { ...safeProfile, twoFactorEnabled: user?.twoFactorEnabled ?? false }
-        })
+        const safeProfile = { ...profile, signatoryNin: profile.signatoryNin ? 'XXX-XXXX-XXXXX' : null }
+        const user = await db.user.findUnique({ where: { id: req.userId! }, select: { twoFactorEnabled: true } })
+        return reply.status(200).send({ profile: { ...safeProfile, twoFactorEnabled: user?.twoFactorEnabled ?? false } })
     })
 
     app.patch('/me', async (req, reply) => {
@@ -199,7 +120,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             contactTitle: z.string().optional(),
         }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const profile = await db.issuerProfile.update({
             where: { userId: req.userId! },
             data: body.data,
@@ -207,8 +127,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
         })
         return reply.status(200).send({ profile })
     })
-
-    // ── ONBOARDING — STEP 1: Institution profile ────────────────────────────────
 
     app.post('/onboarding/step/1', async (req, reply) => {
         const body = z.object({
@@ -228,12 +146,9 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 country: z.string().optional(),
             }),
         }).safeParse(req.body)
-
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
         if (!profile) return reply.status(404).send({ error: 'Not found', message: 'Issuer profile not found.' })
-
         const d = body.data
         await db.issuerProfile.update({
             where: { userId: req.userId! },
@@ -256,41 +171,25 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 onboardingStep: Math.max(profile.onboardingStep ?? 0, 1),
             },
         })
-
-        audit({
-            action: 'ONBOARDING_STEP_1_COMPLETE',
-            req,
-            targetType: 'issuer_profile',
-            targetId: profile.id,
-        })
-
+        audit({ action: 'ONBOARDING_STEP_1_COMPLETE', req, targetType: 'issuer_profile', targetId: profile.id })
         return reply.status(200).send({ success: true, message: 'Step 1 saved.' })
     })
-
-    // ── ONBOARDING — STEP 2: Signatory + NIN ────────────────────────────────────
 
     app.post('/onboarding/step/2', async (req, reply) => {
         const body = z.object({
             signatoryNin: z.string().regex(/^\d{11}$/, 'NIN must be exactly 11 digits'),
             signatoryWorkEmail: z.string().email(),
         }).safeParse(req.body)
-
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
         if (!profile) return reply.status(404).send({ error: 'Not found', message: 'Issuer profile not found.' })
-
         let encryptedNin: string
         try {
             encryptedNin = encryptAES(body.data.signatoryNin)
         } catch (e: any) {
-            app.log.error({ err: e }, 'NIN encryption failed — ENCRYPTION_KEY not configured')
-            return reply.status(500).send({
-                error: 'Configuration error',
-                message: 'Server encryption not configured. Contact support.',
-            })
+            app.log.error({ err: e }, 'NIN encryption failed')
+            return reply.status(500).send({ error: 'Configuration error', message: 'Server encryption not configured. Contact support.' })
         }
-
         await db.issuerProfile.update({
             where: { userId: req.userId! },
             data: {
@@ -299,38 +198,47 @@ export default async function issuerRoutes(app: FastifyInstance) {
                 onboardingStep: Math.max(profile.onboardingStep ?? 0, 2),
             },
         })
-
-        audit({
-            action: 'ONBOARDING_STEP_2_COMPLETE',
-            req,
-            targetType: 'issuer_profile',
-            targetId: profile.id,
-            metadata: { ninProvided: true },
-        })
-
+        audit({ action: 'ONBOARDING_STEP_2_COMPLETE', req, targetType: 'issuer_profile', targetId: profile.id, metadata: { ninProvided: true } })
         return reply.status(200).send({ success: true, message: 'Step 2 saved.' })
     })
-
-    // ── ONBOARDING — DOCUMENT UPLOAD ────────────────────────────────────────────
-    //
-    // SECURITY NOTE: The browser-supplied Content-Type / mimetype is UNTRUSTED.
-    // Chrome on Windows frequently sends PDFs as application/octet-stream.
-    // All file-type decisions are made from magic bytes only. The browser MIME
-    // type is ignored for security purposes and only used as a logging hint.
 
     app.post('/onboarding/documents', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
         if (!profile) return reply.status(404).send({ error: 'Not found', message: 'Issuer profile not found.' })
 
-        const data = await (req as any).file()
-        if (!data) return reply.status(400).send({ error: 'Validation error', message: 'No file received.' })
-
-        // ── Document type validation ──────────────────────────────────────────
-        const docType = data.fields?.documentType?.value ?? data.fields?.documentType
         const validDocTypes = [
             'CAC_CERTIFICATE', 'NUC_ACCREDITATION', 'PROFESSIONAL_CHARTER',
             'LETTER_OF_AUTHORITY', 'CREDENTIAL_SPECIMEN', 'LOGO',
         ]
+
+        let docType: string | null = null
+        let fileBuffer: Buffer | null = null
+        let filename: string = `document-${Date.now()}`
+        let totalSize = 0
+        const MAX_SIZE = 5 * 1024 * 1024
+
+        for await (const part of (req as any).parts()) {
+            if (part.type === 'field' && part.fieldname === 'documentType') {
+                docType = String(part.value ?? '').trim()
+                continue
+            }
+            if (part.type === 'file' && part.fieldname === 'file') {
+                filename = part.filename ?? filename
+                const chunks: Buffer[] = []
+                for await (const chunk of part.file) {
+                    totalSize += chunk.length
+                    if (totalSize > MAX_SIZE) {
+                        part.file.resume?.()
+                        return reply.status(413).send({ error: 'File too large', message: 'Maximum file size is 5 MB.' })
+                    }
+                    chunks.push(chunk)
+                }
+                fileBuffer = Buffer.concat(chunks)
+                continue
+            }
+            if (part.file) part.file.resume?.()
+        }
+
         if (!docType || !validDocTypes.includes(docType)) {
             return reply.status(400).send({
                 error: 'Validation error',
@@ -338,29 +246,10 @@ export default async function issuerRoutes(app: FastifyInstance) {
             })
         }
 
-        // ── Read file into buffer (enforce 5 MB limit while streaming) ────────
-        const MAX_SIZE = 5 * 1024 * 1024
-        const chunks: Buffer[] = []
-        let totalSize = 0
-        for await (const chunk of data.file) {
-            totalSize += chunk.length
-            if (totalSize > MAX_SIZE) {
-                // Drain remaining stream to avoid socket issues
-                data.file.resume?.()
-                return reply.status(413).send({ error: 'File too large', message: 'Maximum file size is 5 MB.' })
-            }
-            chunks.push(chunk)
+        if (!fileBuffer || totalSize === 0) {
+            return reply.status(400).send({ error: 'Validation error', message: 'No file received.' })
         }
 
-        if (totalSize === 0) {
-            return reply.status(400).send({ error: 'Validation error', message: 'File is empty.' })
-        }
-
-        const fileBuffer = Buffer.concat(chunks)
-
-        app.log.info({ firstBytes: fileBuffer.slice(0, 8).toString('hex'), totalSize, browserMime: data.mimetype }, 'document upload received')
-
-        // ── Magic byte file type detection (authoritative) ────────────────────
         const detected = detectFileType(fileBuffer)
         if (!detected) {
             return reply.status(415).send({
@@ -369,16 +258,12 @@ export default async function issuerRoutes(app: FastifyInstance) {
             })
         }
 
-        // ── Per-document-type MIME enforcement ────────────────────────────────
         const allowedForType = ALLOWED_DOC_TYPES[docType] ?? []
         if (!allowedForType.includes(detected.mime)) {
             const friendly: Record<string, string> = {
-                CAC_CERTIFICATE: 'PDF only',
-                NUC_ACCREDITATION: 'PDF only',
-                PROFESSIONAL_CHARTER: 'PDF only',
-                LETTER_OF_AUTHORITY: 'PDF only',
-                CREDENTIAL_SPECIMEN: 'PDF only',
-                LOGO: 'PNG, JPG, or SVG only',
+                CAC_CERTIFICATE: 'PDF only', NUC_ACCREDITATION: 'PDF only',
+                PROFESSIONAL_CHARTER: 'PDF only', LETTER_OF_AUTHORITY: 'PDF only',
+                CREDENTIAL_SPECIMEN: 'PDF only', LOGO: 'PNG, JPG, or SVG only',
             }
             return reply.status(415).send({
                 error: 'UnsupportedMediaType',
@@ -386,11 +271,9 @@ export default async function issuerRoutes(app: FastifyInstance) {
             })
         }
 
-        // ── Use detected MIME type (not browser-supplied) for storage ─────────
         const canonicalMime = detected.mime
-        const filename = data.filename ?? `document-${Date.now()}.${detected.ext}`
+        if (!filename.includes('.')) filename = `${filename}.${detected.ext}`
 
-        // ── Upload to object storage ──────────────────────────────────────────
         let storageKey: string
         try {
             storageKey = await uploadToS3(fileBuffer, filename, canonicalMime, profile.id)
@@ -399,67 +282,44 @@ export default async function issuerRoutes(app: FastifyInstance) {
             return reply.status(500).send({ error: 'Storage error', message: 'Upload failed. Please try again.' })
         }
 
-        // ── Upsert document record (one record per docType per issuer) ────────
         const doc = await db.issuerDocument.upsert({
             where: { issuerId_documentType: { issuerId: profile.id, documentType: docType as any } },
             create: {
-                issuerId: profile.id,
-                documentType: docType as any,
-                filename,
-                storageKey,
-                mimeType: canonicalMime,
-                fileSizeBytes: totalSize,
-                reviewStatus: 'PENDING',
-                virusScanStatus: 'PENDING',
+                issuerId: profile.id, documentType: docType as any, filename,
+                storageKey, mimeType: canonicalMime, fileSizeBytes: totalSize,
+                reviewStatus: 'PENDING', virusScanStatus: 'PENDING',
             },
             update: {
-                filename,
-                storageKey,
-                mimeType: canonicalMime,
-                fileSizeBytes: totalSize,
-                reviewStatus: 'PENDING',
-                virusScanStatus: 'PENDING',
-                reviewedAt: null,
-                reviewedById: null,
-                reviewNote: null,
+                filename, storageKey, mimeType: canonicalMime, fileSizeBytes: totalSize,
+                reviewStatus: 'PENDING', virusScanStatus: 'PENDING',
+                reviewedAt: null, reviewedById: null, reviewNote: null,
             },
         })
 
         audit({
-            action: 'ONBOARDING_DOCUMENT_UPLOADED',
-            req,
-            targetType: 'issuer_document',
-            targetId: doc.id,
+            action: 'ONBOARDING_DOCUMENT_UPLOADED', req,
+            targetType: 'issuer_document', targetId: doc.id,
             metadata: { documentType: docType, filename, fileSizeBytes: totalSize, detectedMime: canonicalMime },
         })
 
         return reply.status(201).send({
-            id: doc.id,
-            documentType: doc.documentType,
-            filename: doc.filename,
-            reviewStatus: doc.reviewStatus,
-            uploadedAt: doc.uploadedAt,
+            id: doc.id, documentType: doc.documentType,
+            filename: doc.filename, reviewStatus: doc.reviewStatus, uploadedAt: doc.uploadedAt,
         })
     })
 
     app.delete('/onboarding/documents/:docId', async (req, reply) => {
         const { docId } = req.params as { docId: string }
-
         const profile = await db.issuerProfile.findUnique({ where: { userId: req.userId! } })
         if (!profile) return reply.status(404).send({ error: 'Not found' })
-
         const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: profile.id } })
         if (!doc) return reply.status(404).send({ error: 'Not found', message: 'Document not found.' })
-
         if (profile.status === 'UNDER_REVIEW' || profile.status === 'APPROVED') {
             return reply.status(409).send({ error: 'Conflict', message: 'Cannot remove documents after submission.' })
         }
-
         await db.issuerDocument.delete({ where: { id: docId } })
         return reply.status(204).send()
     })
-
-    // ── ONBOARDING — STEP 3: Submit for review ──────────────────────────────────
 
     app.post('/onboarding/step/3', async (req, reply) => {
         const profile = await db.issuerProfile.findUnique({
@@ -467,48 +327,19 @@ export default async function issuerRoutes(app: FastifyInstance) {
             include: { documents: true },
         })
         if (!profile) return reply.status(404).send({ error: 'Not found' })
-
-        if (profile.status === 'UNDER_REVIEW') {
-            return reply.status(409).send({ error: 'Conflict', message: 'Application is already under review.' })
-        }
-        if (profile.status === 'APPROVED') {
-            return reply.status(409).send({ error: 'Conflict', message: 'Issuer is already approved.' })
-        }
-
+        if (profile.status === 'UNDER_REVIEW') return reply.status(409).send({ error: 'Conflict', message: 'Application is already under review.' })
+        if (profile.status === 'APPROVED') return reply.status(409).send({ error: 'Conflict', message: 'Issuer is already approved.' })
         const hasCac = profile.documents.some((d: any) => d.documentType === 'CAC_CERTIFICATE')
-        if (!hasCac) {
-            return reply.status(400).send({
-                error: 'Validation error',
-                message: 'CAC Certificate is required before submitting for review.',
-            })
-        }
-
-        await db.issuerProfile.update({
-            where: { userId: req.userId! },
-            data: { status: 'UNDER_REVIEW', onboardingStep: 3 },
-        })
-
-        audit({
-            action: 'ONBOARDING_SUBMITTED_FOR_REVIEW',
-            req,
-            targetType: 'issuer_profile',
-            targetId: profile.id,
-        })
-
+        if (!hasCac) return reply.status(400).send({ error: 'Validation error', message: 'CAC Certificate is required before submitting for review.' })
+        await db.issuerProfile.update({ where: { userId: req.userId! }, data: { status: 'UNDER_REVIEW', onboardingStep: 3 } })
+        audit({ action: 'ONBOARDING_SUBMITTED_FOR_REVIEW', req, targetType: 'issuer_profile', targetId: profile.id })
         emailQueue.add('onboarding_submitted', {
             type: 'admin_notification',
             to: env.ADMIN_EMAIL ?? '',
-            data: {
-                institutionName: profile.institutionName,
-                issuerId: profile.id,
-                dashboardUrl: `${env.FRONTEND_URL}/pages/dashboard-admin.html`,
-            },
+            data: { institutionName: profile.institutionName, issuerId: profile.id, dashboardUrl: `${env.FRONTEND_URL}/pages/dashboard-admin.html` },
         }).catch((e: any) => app.log.error({ err: e }, 'Admin notification email failed'))
-
         return reply.status(200).send({ success: true, message: 'Application submitted for review.' })
     })
-
-    // ── CREDENTIALS ──────────────────────────────────────────────────────────────
 
     app.get('/me/credentials', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const query = z.object({
@@ -520,7 +351,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             to: z.string().datetime().optional(),
         }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
-
         const { page, limit, status, search, from, to } = query.data
         const where: any = {
             issuerId: req.issuerId!,
@@ -532,14 +362,8 @@ export default async function issuerRoutes(app: FastifyInstance) {
                     { id: { contains: search } },
                 ]
             } : {}),
-            ...(from || to ? {
-                issueDate: {
-                    ...(from ? { gte: new Date(from) } : {}),
-                    ...(to ? { lte: new Date(to) } : {}),
-                }
-            } : {}),
+            ...(from || to ? { issueDate: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } } : {}),
         }
-
         const [credentials, total] = await db.$transaction([
             db.credential.findMany({
                 where,
@@ -555,7 +379,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             }),
             db.credential.count({ where }),
         ])
-
         return reply.status(200).send({ credentials, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
 
@@ -565,55 +388,30 @@ export default async function issuerRoutes(app: FastifyInstance) {
             where: { id },
             include: {
                 verifications: {
-                    take: 10,
-                    orderBy: { verifiedAt: 'desc' },
-                    select: {
-                        id: true,
-                        method: true,
-                        result: true,
-                        verifiedAt: true,
-                        ipAddress: true,
-                        country: true,
-                    },
+                    take: 10, orderBy: { verifiedAt: 'desc' },
+                    select: { id: true, method: true, result: true, verifiedAt: true, ipAddress: true, country: true },
                 },
             },
         })
         if (!cred || cred.issuerId !== req.issuerId) return reply.status(404).send({ error: 'Not found' })
-
-        const serialisable = {
-            ...cred,
-            blockNumber: cred.blockNumber != null ? cred.blockNumber.toString() : null,
-        }
-
+        const serialisable = { ...cred, blockNumber: cred.blockNumber != null ? cred.blockNumber.toString() : null }
         return reply.status(200).send({ credential: serialisable })
     })
 
     app.get('/me/notifications', { preHandler: requireIssuer }, async (req, reply) => {
         try {
-            const issuer = await db.issuerProfile.findUnique({
-                where: { userId: req.userId! },
-                select: { id: true },
-            })
+            const issuer = await db.issuerProfile.findUnique({ where: { userId: req.userId! }, select: { id: true } })
             if (!issuer) return reply.status(404).send({ error: 'Not found' })
-
             const messages = await db.onboardingMessage.findMany({
                 where: { issuerId: issuer.id, direction: 'ADMIN_TO_ISSUER' },
                 orderBy: { createdAt: 'desc' },
                 take: 30,
             })
-
             const notifications = messages.map(m => ({
-                id: m.id,
-                type: 'ADMIN_NOTE',
-                title: 'Message from VeriSure review team',
-                body: m.body,
-                readAt: m.readAt,
-                createdAt: m.createdAt,
+                id: m.id, type: 'ADMIN_NOTE', title: 'Message from VeriSure review team',
+                body: m.body, readAt: m.readAt, createdAt: m.createdAt,
             }))
-
-            const unreadCount = notifications.filter(n => !n.readAt).length
-
-            return reply.send({ notifications, unreadCount })
+            return reply.send({ notifications, unreadCount: notifications.filter(n => !n.readAt).length })
         } catch (err) {
             app.log.error({ err }, 'Get notifications error')
             return reply.status(500).send({ error: 'Server error' })
@@ -623,18 +421,9 @@ export default async function issuerRoutes(app: FastifyInstance) {
     app.post('/me/notifications/:id/read', { preHandler: requireIssuer }, async (req, reply) => {
         try {
             const { id } = req.params as { id: string }
-
-            const issuer = await db.issuerProfile.findUnique({
-                where: { userId: req.userId! },
-                select: { id: true },
-            })
+            const issuer = await db.issuerProfile.findUnique({ where: { userId: req.userId! }, select: { id: true } })
             if (!issuer) return reply.status(404).send({ error: 'Not found' })
-
-            await db.onboardingMessage.updateMany({
-                where: { id, issuerId: issuer.id },
-                data: { readAt: new Date() },
-            })
-
+            await db.onboardingMessage.updateMany({ where: { id, issuerId: issuer.id }, data: { readAt: new Date() } })
             return reply.send({ ok: true })
         } catch (err) {
             app.log.error({ err }, 'Mark notification read error')
@@ -642,31 +431,15 @@ export default async function issuerRoutes(app: FastifyInstance) {
         }
     })
 
-
-    // ── ANALYTICS ────────────────────────────────────────────────────────────────
-
     app.get('/me/analytics', { preHandler: requireApprovedIssuer }, async (req, reply) => {
-        const query = z.object({
-            period: z.enum(['7d', '30d', '90d', '365d']).default('30d'),
-        }).safeParse(req.query)
+        const query = z.object({ period: z.enum(['7d', '30d', '90d', '365d']).default('30d') }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
-
         const days = { '7d': 7, '30d': 30, '90d': 90, '365d': 365 }[query.data.period] ?? 30
         const from = new Date(Date.now() - days * 86400000)
         const issuerId = req.issuerId!
-
-        // ── CORE METRICS ──────────────────────────────────────────────────────
         const [
-            totalIssued,
-            totalVerifications,
-            issuedInPeriod,
-            verificationsInPeriod,
-            byStatus,
-            byType,
-            revoked,
-            topVerifiers,
-            geo,
-            anchorPending,
+            totalIssued, totalVerifications, issuedInPeriod, verificationsInPeriod,
+            byStatus, byType, revoked, topVerifiers, geo, anchorPending,
         ] = await Promise.all([
             db.credential.count({ where: { issuerId } }),
             db.verificationLog.count({ where: { credential: { issuerId } } }),
@@ -679,16 +452,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             db.verificationLog.groupBy({ by: ['country'], where: { credential: { issuerId }, country: { not: null } }, _count: true, orderBy: { _count: { country: 'desc' } }, take: 10 }),
             db.credential.count({ where: { issuerId, txHash: null, status: { not: 'REVOKED' } } }),
         ])
-
-        // ── REACH METRICS ─────────────────────────────────────────────────────
-        const [
-            totalShares,
-            sharesInPeriod,
-            linkOpens,
-            linkOpensInPeriod,
-            unclaimedCredentials,
-            geoReach,
-        ] = await Promise.all([
+        const [totalShares, sharesInPeriod, linkOpens, linkOpensInPeriod, unclaimedCredentials, geoReach] = await Promise.all([
             db.shareGrant.count({ where: { credential: { issuerId } } }),
             db.shareGrant.count({ where: { credential: { issuerId }, createdAt: { gte: from } } }),
             db.verificationLog.count({ where: { credential: { issuerId }, method: { in: ['QR_SCAN', 'SELF_VERIFY'] } } }),
@@ -696,40 +460,22 @@ export default async function issuerRoutes(app: FastifyInstance) {
             db.credential.count({ where: { issuerId, holderUserId: null, status: { not: 'REVOKED' } } }),
             db.verificationLog.groupBy({ by: ['country'], where: { credential: { issuerId }, country: { not: null } }, _count: true, orderBy: { _count: { country: 'desc' } }, take: 1 }),
         ])
-
-        const countriesReached = geo.length
-        const topCountry = geoReach[0]?.country ?? null
-
-        // ── VERIFIER NAME RESOLUTION ──────────────────────────────────────────
         const verifierIds = topVerifiers.map(v => v.verifierId!).filter(Boolean)
-        const verifierProfiles = await db.verifierProfile.findMany({
-            where: { id: { in: verifierIds } },
-            select: { id: true, organisationName: true },
-        })
+        const verifierProfiles = await db.verifierProfile.findMany({ where: { id: { in: verifierIds } }, select: { id: true, organisationName: true } })
         const verifierMap = new Map(verifierProfiles.map(v => [v.id, v.organisationName]))
-
         const [dailyIssuances, dailyVerifications] = await Promise.all([
             buildDailySeries(issuerId, from, 'issued'),
             buildDailySeries(issuerId, from, 'verified'),
         ])
-
         return reply.status(200).send({
             summary: {
-                totalIssued,
-                totalVerifications,
-                issuedInPeriod,
-                verificationsInPeriod,
+                totalIssued, totalVerifications, issuedInPeriod, verificationsInPeriod,
                 revocationRate: totalIssued > 0 ? ((revoked / totalIssued) * 100).toFixed(2) + '%' : '0%',
                 pendingAnchor: anchorPending,
             },
             reach: {
-                totalShares,
-                sharesInPeriod,
-                linkOpens,
-                linkOpensInPeriod,
-                countriesReached,
-                topCountry,
-                unclaimedCredentials,
+                totalShares, sharesInPeriod, linkOpens, linkOpensInPeriod,
+                countriesReached: geo.length, topCountry: geoReach[0]?.country ?? null, unclaimedCredentials,
             },
             byStatus: Object.fromEntries(byStatus.map(s => [s.status, s._count])),
             byType: byType.map(t => ({ type: t.credentialType, count: t._count })),
@@ -738,8 +484,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             timeSeries: { period: query.data.period, issuances: dailyIssuances, verifications: dailyVerifications },
         })
     })
-
-    // ── BULK ISSUANCE ────────────────────────────────────────────────────────────
 
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const body = z.object({
@@ -755,34 +499,16 @@ export default async function issuerRoutes(app: FastifyInstance) {
             filename: z.string().optional(),
         }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const job = await db.bulkJob.create({
-            data: {
-                type: 'issuance',
-                issuerId: req.issuerId!,
-                filename: body.data.filename ?? `bulk_${Date.now()}.json`,
-                totalRows: body.data.credentials.length,
-                status: 'PENDING',
-            },
+            data: { type: 'issuance', issuerId: req.issuerId!, filename: body.data.filename ?? `bulk_${Date.now()}.json`, totalRows: body.data.credentials.length, status: 'PENDING' },
         })
-        await bulkQueue.add('bulk-issuance', {
-            jobId: job.id,
-            type: 'issuance',
-            fileKey: JSON.stringify(body.data.credentials),
-            issuerId: req.issuerId!,
-        })
-
+        await bulkQueue.add('bulk-issuance', { jobId: job.id, type: 'issuance', fileKey: JSON.stringify(body.data.credentials), issuerId: req.issuerId! })
         audit({ action: 'BULK_IMPORT_STARTED', req, targetType: 'bulk_job', targetId: job.id, metadata: { rows: body.data.credentials.length } })
-
         return reply.status(202).send({ jobId: job.id, status: 'PENDING', rows: body.data.credentials.length })
     })
 
     app.get('/me/bulk-jobs', async (req, reply) => {
-        const jobs = await db.bulkJob.findMany({
-            where: { issuerId: req.issuerId!, type: 'issuance' },
-            orderBy: { createdAt: 'desc' },
-            take: 20,
-        })
+        const jobs = await db.bulkJob.findMany({ where: { issuerId: req.issuerId!, type: 'issuance' }, orderBy: { createdAt: 'desc' }, take: 20 })
         return reply.status(200).send({ jobs })
     })
 
@@ -793,53 +519,25 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ job })
     })
 
-    // ── TEAM ─────────────────────────────────────────────────────────────────────
-
     app.get('/me/team', async (req, reply) => {
-        const members = await db.issuerTeamMember.findMany({
-            where: { issuerId: req.issuerId! },
-            orderBy: { invitedAt: 'desc' },
-        })
+        const members = await db.issuerTeamMember.findMany({ where: { issuerId: req.issuerId! }, orderBy: { invitedAt: 'desc' } })
         return reply.status(200).send({ members })
     })
 
     app.post('/me/team', { preHandler: requireApprovedIssuer }, async (req, reply) => {
-        const body = z.object({
-            email: z.string().email().toLowerCase(),
-            role: z.enum(['admin', 'issuer', 'viewer']),
-        }).safeParse(req.body)
+        const body = z.object({ email: z.string().email().toLowerCase(), role: z.enum(['admin', 'issuer', 'viewer']) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const count = await db.issuerTeamMember.count({ where: { issuerId: req.issuerId! } })
         if (count >= 20) return reply.status(429).send({ error: 'Limit exceeded', message: 'Max 20 team members' })
-
-        const existing = await db.issuerTeamMember.findUnique({
-            where: { issuerId_email: { issuerId: req.issuerId!, email: body.data.email } },
-        })
+        const existing = await db.issuerTeamMember.findUnique({ where: { issuerId_email: { issuerId: req.issuerId!, email: body.data.email } } })
         if (existing) return reply.status(409).send({ error: 'Conflict', message: 'Already a member' })
-
         const token = generateSecureToken()
         const tokenHash = sha256(token)
         const member = await db.issuerTeamMember.create({
-            data: {
-                issuerId: req.issuerId!,
-                email: body.data.email,
-                role: body.data.role,
-                inviteTokenHash: tokenHash,
-                inviteExpiresAt: new Date(Date.now() + 604800000),
-            },
+            data: { issuerId: req.issuerId!, email: body.data.email, role: body.data.role, inviteTokenHash: tokenHash, inviteExpiresAt: new Date(Date.now() + 604800000) },
         })
-
-        const issuer = await db.issuerProfile.findUnique({
-            where: { id: req.issuerId! },
-            select: { institutionName: true },
-        })
-        await emailQueue.add('team_invite', {
-            type: 'email_verification',
-            to: body.data.email,
-            data: { verifyUrl: `${env.FRONTEND_URL}/team/accept?token=${token}`, institutionName: issuer?.institutionName ?? '' },
-        })
-
+        const issuer = await db.issuerProfile.findUnique({ where: { id: req.issuerId! }, select: { institutionName: true } })
+        await emailQueue.add('team_invite', { type: 'email_verification', to: body.data.email, data: { verifyUrl: `${env.FRONTEND_URL}/team/accept?token=${token}`, institutionName: issuer?.institutionName ?? '' } })
         return reply.status(201).send({ memberId: member.id, email: member.email, role: member.role })
     })
 
@@ -847,10 +545,8 @@ export default async function issuerRoutes(app: FastifyInstance) {
         const { memberId } = req.params as { memberId: string }
         const body = z.object({ role: z.enum(['admin', 'issuer', 'viewer']) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error' })
-
         const m = await db.issuerTeamMember.findUnique({ where: { id: memberId }, select: { issuerId: true } })
         if (!m || m.issuerId !== req.issuerId) return reply.status(404).send({ error: 'Not found' })
-
         await db.issuerTeamMember.update({ where: { id: memberId }, data: { role: body.data.role } })
         return reply.status(200).send({ message: 'Role updated' })
     })
@@ -862,8 +558,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
         await db.issuerTeamMember.delete({ where: { id: memberId } })
         return reply.status(200).send({ message: 'Member removed' })
     })
-
-    // ── QR TEMPLATE ──────────────────────────────────────────────────────────────
 
     app.get('/me/qr-template', async (req, reply) => {
         const t = await db.whitelabelPortal.findUnique({
@@ -880,7 +574,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
             primaryColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
         }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const t = await db.whitelabelPortal.upsert({
             where: { issuerId: req.issuerId! },
             create: { issuerId: req.issuerId!, displayName: body.data.displayName, tagline: body.data.tagline ?? null, primaryColor: body.data.primaryColor ?? '#0047AB' },
@@ -889,15 +582,12 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ template: t })
     })
 
-    // ── VERIFICATION HISTORY ─────────────────────────────────────────────────────
-
     app.get('/me/verifications', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const query = z.object({
             page: z.coerce.number().int().min(1).default(1),
             limit: z.coerce.number().int().min(1).max(100).default(25),
         }).safeParse(req.query)
         if (!query.success) return reply.status(400).send({ error: 'Validation error' })
-
         const { page, limit } = query.data
         const [logs, total] = await db.$transaction([
             db.verificationLog.findMany({
@@ -912,11 +602,8 @@ export default async function issuerRoutes(app: FastifyInstance) {
             }),
             db.verificationLog.count({ where: { credential: { issuerId: req.issuerId! } } }),
         ])
-
         return reply.status(200).send({ logs, pagination: { page, limit, total, pages: Math.ceil(total / limit) } })
     })
-
-    // ── PASSWORD CHANGE ──────────────────────────────────────────────────────────
 
     app.patch('/me/password', async (req, reply) => {
         const body = z.object({
@@ -924,28 +611,17 @@ export default async function issuerRoutes(app: FastifyInstance) {
             newPassword: z.string().min(12).max(128),
         }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-
         const user = await db.user.findUnique({ where: { id: req.userId! }, select: { id: true, passwordHash: true } })
         if (!user) return reply.status(404).send({ error: 'Not found' })
-
         if (!await verifyPwd(body.data.currentPassword, user.passwordHash)) {
             return reply.status(401).send({ error: 'Unauthorized', message: 'Current password is incorrect' })
         }
-
         await db.user.update({ where: { id: req.userId! }, data: { passwordHash: await hashPwd(body.data.newPassword), failedLoginCount: 0 } })
         await revokeAllUserTokens(req.userId!)
-
-        await db.userSession.updateMany({
-            where: { userId: req.userId!, isActive: true },
-            data: { isActive: false, revokedAt: new Date() },
-        }).catch(() => { })
-
+        await db.userSession.updateMany({ where: { userId: req.userId!, isActive: true }, data: { isActive: false, revokedAt: new Date() } }).catch(() => { })
         audit({ action: 'USER_PASSWORD_CHANGED', req, targetType: 'user', targetId: req.userId! })
-
         return reply.status(200).send({ message: 'Password updated. Please log in again.' })
     })
-
-    // ── SESSIONS ─────────────────────────────────────────────────────────────────
 
     app.get('/me/sessions', async (req, reply) => {
         const sessions = await db.userSession.findMany({
@@ -972,8 +648,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
         return reply.status(200).send({ message: 'All sessions revoked' })
     })
 
-    // ── 2FA ──────────────────────────────────────────────────────────────────────
-
     app.post('/me/2fa/setup', async (req, reply) => {
         const { generateTotpSecret, encrypt } = await import('../../lib/crypto.js')
         const secret = generateTotpSecret()
@@ -987,16 +661,13 @@ export default async function issuerRoutes(app: FastifyInstance) {
     app.post('/me/2fa/confirm', async (req, reply) => {
         const body = z.object({ code: z.string().length(6) }).safeParse(req.body)
         if (!body.success) return reply.status(400).send({ error: 'Validation error' })
-
         const user = await db.user.findUnique({ where: { id: req.userId! }, select: { twoFactorSecret: true } })
         if (!user?.twoFactorSecret) return reply.status(400).send({ error: 'Bad request', message: 'Setup not initiated. Call /me/2fa/setup first.' })
-
         const { decrypt } = await import('../../lib/crypto.js')
         const { authenticator } = await import('otplib')
         const secret = decrypt(user.twoFactorSecret)
         const isValid = authenticator.verify({ token: body.data.code, secret })
         if (!isValid) return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid code. Try again.' })
-
         await db.user.update({ where: { id: req.userId! }, data: { twoFactorEnabled: true } })
         return reply.status(200).send({ message: '2FA enabled. You can now issue credentials.' })
     })
@@ -1007,8 +678,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
     })
 
 }
-
-// ── HELPERS ──────────────────────────────────────────────────────────────────────
 
 const scryptAsyncHelper = scryptAsync
 
@@ -1062,18 +731,8 @@ function encryptAES(plaintext: string): string {
 }
 
 async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
-    const s3 = new S3Client({
-        region: env.S3_REGION ?? 'auto',
-        endpoint: env.S3_ENDPOINT,
-        forcePathStyle: false,
-    })
+    const s3 = new S3Client({ region: env.S3_REGION ?? 'auto', endpoint: env.S3_ENDPOINT, forcePathStyle: false })
     const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-    await s3.send(new PutObjectCommand({
-        Bucket: env.S3_BUCKET,
-        Key: key,
-        Body: fileBuffer,
-        ContentType: mimeType,
-        ServerSideEncryption: 'AES256',
-    }))
+    await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: key, Body: fileBuffer, ContentType: mimeType, ServerSideEncryption: 'AES256' }))
     return key
 }
