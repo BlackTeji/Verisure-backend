@@ -9,9 +9,8 @@ import { requireIssuer, requireApprovedIssuer } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
-import { createCipheriv, randomBytes, scrypt } from 'node:crypto'
+import { createCipheriv, createHash, createHmac, randomBytes, scrypt } from 'node:crypto'
 import { promisify } from 'node:util'
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 const scryptAsync = promisify(scrypt)
 
@@ -731,16 +730,66 @@ function encryptAES(plaintext: string): string {
 }
 
 async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string, issuerId: string): Promise<string> {
-    const s3 = new S3Client({
-        region: env.S3_REGION ?? 'auto',
-        endpoint: env.S3_ENDPOINT,
-        forcePathStyle: false,
-        credentials: {
-            accessKeyId: env.S3_ACCESS_KEY_ID ?? '',
-            secretAccessKey: env.S3_SECRET_ACCESS_KEY ?? '',
-        },
-    })
     const key = `onboarding/${issuerId}/${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-    await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: key, Body: fileBuffer, ContentType: mimeType, ServerSideEncryption: 'AES256' }))
+    const bucket = env.S3_BUCKET ?? ''
+    const region = env.S3_REGION ?? 'auto'
+    const endpoint = env.S3_ENDPOINT ?? ''
+    const accessKeyId = env.S3_ACCESS_KEY_ID ?? ''
+    const secretAccessKey = env.S3_SECRET_ACCESS_KEY ?? ''
+
+    const url = `${endpoint}/${bucket}/${key}`
+    const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z'
+    const date = datetime.slice(0, 8)
+
+    const payloadHash = createHash('sha256').update(fileBuffer).digest('hex')
+
+    const headers: Record<string, string> = {
+        'Content-Type': mimeType,
+        'Content-Length': String(fileBuffer.length),
+        'Host': new URL(endpoint).host,
+        'x-amz-content-sha256': payloadHash,
+        'x-amz-date': datetime,
+        'x-amz-server-side-encryption': 'AES256',
+    }
+
+    const signedHeaders = Object.keys(headers).sort().join(';')
+    const canonicalHeaders = Object.keys(headers).sort().map(k => `${k}:${headers[k]}`).join('\n') + '\n'
+
+    const canonicalRequest = [
+        'PUT',
+        `/${bucket}/${key}`,
+        '',
+        canonicalHeaders,
+        signedHeaders,
+        payloadHash,
+    ].join('\n')
+
+    const credentialScope = `${date}/${region}/s3/aws4_request`
+    const stringToSign = [
+        'AWS4-HMAC-SHA256',
+        datetime,
+        credentialScope,
+        createHash('sha256').update(canonicalRequest).digest('hex'),
+    ].join('\n')
+
+    const hmac = (key: Buffer | string, data: string) =>
+        createHmac('sha256', key).update(data).digest()
+
+    const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, date), region), 's3'), 'aws4_request')
+    const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex')
+
+    const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+
+    const res = await fetch(url, {
+        method: 'PUT',
+        headers: { ...headers, Authorization: authorization },
+        body: fileBuffer,
+    })
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText)
+        throw new Error(`R2 upload failed: ${res.status} ${text}`)
+    }
+
     return key
 }
