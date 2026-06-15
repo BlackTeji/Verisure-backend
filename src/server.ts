@@ -5,6 +5,7 @@ import FastifyRateLimit from '@fastify/rate-limit'
 import FastifySwagger from '@fastify/swagger'
 import FastifySwaggerUi from '@fastify/swagger-ui'
 import FastifyCookie from '@fastify/cookie'
+import FastifyMultipart from '@fastify/multipart'
 import { env } from './config/env.js'
 import { redis } from './lib/redis.js'
 import { logger } from './lib/logger.js'
@@ -31,13 +32,10 @@ const app = Fastify({
     bodyLimit: 1_048_576,
 })
 
-// ── PLUGINS ───────────────────────────────────────────────────────────────
-
 await app.register(FastifyHelmet, {
     contentSecurityPolicy: {
         directives: { defaultSrc: ["'none'"], scriptSrc: ["'none'"], styleSrc: ["'none'"], imgSrc: ["'none'"] },
     },
-
     crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: false,
     dnsPrefetchControl: { allow: false },
@@ -51,11 +49,7 @@ await app.register(FastifyHelmet, {
 await app.register(FastifyCors, {
     origin: (origin, cb) => {
         if (!origin) return cb(null, true)
-
-        if (env.ALLOWED_ORIGINS.includes(origin)) {
-            return cb(null, true)
-        }
-
+        if (env.ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
         logger.warn({ origin, allowed: env.ALLOWED_ORIGINS }, 'cors: rejected origin')
         return cb(new Error(`CORS: origin '${origin}' not in ALLOWED_ORIGINS`), false)
     },
@@ -66,6 +60,15 @@ await app.register(FastifyCors, {
 })
 
 await app.register(FastifyCookie as any)
+
+await app.register(FastifyMultipart, {
+    limits: {
+        fileSize: 5 * 1024 * 1024,
+        files: 1,
+        fields: 10,
+        fieldSize: 1024,
+    },
+})
 
 await app.register(FastifyRateLimit, {
     global: true,
@@ -92,8 +95,6 @@ if (env.NODE_ENV !== 'production') {
     await app.register(FastifySwaggerUi, { routePrefix: '/api/docs' })
 }
 
-// ── GLOBAL HOOKS ──────────────────────────────────────────────────────────
-
 app.addHook('onSend', async (_req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff')
     reply.header('X-Frame-Options', 'DENY')
@@ -102,8 +103,6 @@ app.addHook('onSend', async (_req, reply) => {
 })
 
 app.addHook('onRequest', checkBlockedIp)
-
-// ── ROUTES ────────────────────────────────────────────────────────────────
 
 app.get('/api/health', async (_req, reply) =>
     reply.status(200).send({ status: 'ok', timestamp: new Date().toISOString(), env: env.NODE_ENV }))
@@ -114,8 +113,6 @@ await app.register(issuerRoutes, { prefix: '/api/v1/issuers' })
 await app.register(holderRoutes, { prefix: '/api/v1/holders' })
 await app.register(verifierRoutes, { prefix: '/api/v1/verifiers' })
 await app.register(adminRoutes, { prefix: '/api/v1/admin' })
-
-// ── ERROR HANDLERS ────────────────────────────────────────────────────────
 
 app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'Not found' }))
 
@@ -130,19 +127,15 @@ app.setErrorHandler((err, _req, reply) => {
     })
 })
 
-// ── STARTUP ───────────────────────────────────────────────────────────────
-
 async function start() {
     try {
         await db.$connect()
         logger.info('db: connected')
-
         try {
             await syncBlockedIpsFromDb()
         } catch (err) {
             logger.warn({ err }, 'startup: syncBlockedIps failed — continuing without blocked IP cache')
         }
-
         await app.listen({ port: env.PORT, host: env.HOST })
         logger.info(`server: listening on ${env.HOST}:${env.PORT}`)
     } catch (err) {
@@ -150,8 +143,6 @@ async function start() {
         process.exit(1)
     }
 }
-
-// ── SHUTDOWN ──────────────────────────────────────────────────────────────
 
 async function shutdown(signal: string) {
     logger.info({ signal }, 'shutting down')
