@@ -11,6 +11,7 @@ import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
 import { createCipheriv, createHash, createHmac, randomBytes, scrypt } from 'node:crypto'
 import { promisify } from 'node:util'
+import { request as httpsRequest } from 'node:https'
 
 const scryptAsync = promisify(scrypt)
 
@@ -764,8 +765,7 @@ async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string
     headers['authorization'] = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 
     await new Promise<void>((resolve, reject) => {
-        const { request } = require('node:https')
-        const req = request(
+        const req = httpsRequest(
             {
                 hostname: endpointUrl.hostname,
                 path: endpointUrl.pathname,
