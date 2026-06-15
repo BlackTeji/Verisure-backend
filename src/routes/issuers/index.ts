@@ -737,59 +737,58 @@ async function uploadToS3(fileBuffer: Buffer, filename: string, mimeType: string
     const accessKeyId = env.S3_ACCESS_KEY_ID ?? ''
     const secretAccessKey = env.S3_SECRET_ACCESS_KEY ?? ''
 
-    const url = `${endpoint}/${bucket}/${key}`
+    const endpointUrl = new URL(`/${bucket}/${key}`, endpoint)
     const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z'
     const date = datetime.slice(0, 8)
-
     const payloadHash = createHash('sha256').update(fileBuffer).digest('hex')
 
     const headers: Record<string, string> = {
-        'Content-Type': mimeType,
-        'Content-Length': String(fileBuffer.length),
-        'Host': new URL(endpoint).host,
+        'content-type': mimeType,
+        'content-length': String(fileBuffer.length),
+        'host': endpointUrl.host,
         'x-amz-content-sha256': payloadHash,
         'x-amz-date': datetime,
         'x-amz-server-side-encryption': 'AES256',
     }
 
-    const signedHeaders = Object.keys(headers).sort().join(';')
-    const canonicalHeaders = Object.keys(headers).sort().map(k => `${k}:${headers[k]}`).join('\n') + '\n'
-
-    const canonicalRequest = [
-        'PUT',
-        `/${bucket}/${key}`,
-        '',
-        canonicalHeaders,
-        signedHeaders,
-        payloadHash,
-    ].join('\n')
-
+    const sortedKeys = Object.keys(headers).sort()
+    const signedHeaders = sortedKeys.join(';')
+    const canonicalHeaders = sortedKeys.map(k => `${k}:${headers[k]}`).join('\n') + '\n'
+    const canonicalRequest = ['PUT', endpointUrl.pathname, '', canonicalHeaders, signedHeaders, payloadHash].join('\n')
     const credentialScope = `${date}/${region}/s3/aws4_request`
-    const stringToSign = [
-        'AWS4-HMAC-SHA256',
-        datetime,
-        credentialScope,
-        createHash('sha256').update(canonicalRequest).digest('hex'),
-    ].join('\n')
+    const stringToSign = ['AWS4-HMAC-SHA256', datetime, credentialScope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
 
-    const hmac = (key: Buffer | string, data: string) =>
-        createHmac('sha256', key).update(data).digest()
-
+    const hmac = (k: Buffer | string, d: string) => createHmac('sha256', k).update(d).digest()
     const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, date), region), 's3'), 'aws4_request')
     const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex')
+    headers['authorization'] = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 
-    const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
-
-    const res = await fetch(url, {
-        method: 'PUT',
-        headers: { ...headers, Authorization: authorization },
-        body: fileBuffer,
+    await new Promise<void>((resolve, reject) => {
+        const { request } = require('node:https')
+        const req = request(
+            {
+                hostname: endpointUrl.hostname,
+                path: endpointUrl.pathname,
+                method: 'PUT',
+                headers,
+                rejectUnauthorized: false,
+            },
+            (res: any) => {
+                const chunks: Buffer[] = []
+                res.on('data', (c: Buffer) => chunks.push(c))
+                res.on('end', () => {
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                        resolve()
+                    } else {
+                        reject(new Error(`R2 upload failed: ${res.statusCode} ${Buffer.concat(chunks).toString()}`))
+                    }
+                })
+            }
+        )
+        req.on('error', reject)
+        req.write(fileBuffer)
+        req.end()
     })
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => res.statusText)
-        throw new Error(`R2 upload failed: ${res.status} ${text}`)
-    }
 
     return key
 }
