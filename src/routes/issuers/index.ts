@@ -195,13 +195,13 @@ export default async function issuerRoutes(app: FastifyInstance) {
             'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
             'X-Amz-Date': datetime,
             'X-Amz-Expires': '300',
-            'X-Amz-SignedHeaders': 'content-type;host',
+            'X-Amz-SignedHeaders': 'host',
         })
 
         const host = new URL(endpoint).host
         const canonicalUri = `/${bucket}/${storageKey}`
-        const canonicalHeaders = `content-type:${mimeType}\nhost:${host}\n`
-        const canonicalRequest = ['PUT', canonicalUri, params.toString(), canonicalHeaders, 'content-type;host', 'UNSIGNED-PAYLOAD'].join('\n')
+        const canonicalHeaders = `host:${host}\n`
+        const canonicalRequest = ['PUT', canonicalUri, params.toString(), canonicalHeaders, 'host', 'UNSIGNED-PAYLOAD'].join('\n')
         const stringToSign = ['AWS4-HMAC-SHA256', datetime, credentialScope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
 
         const hmac = (k: Buffer | string, d: string) => createHmac('sha256', k).update(d).digest()
