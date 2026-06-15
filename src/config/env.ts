@@ -24,9 +24,6 @@ const schema = z.object({
         .length(64, 'API_KEY_ENCRYPTION_KEY must be 64 hex chars (32 bytes)')
         .regex(/^[0-9a-f]{64}$/, 'API_KEY_ENCRYPTION_KEY must be lowercase hex only'),
 
-    // Used for NIN and other sensitive field encryption (AES-256-GCM).
-    // Must be 64 lowercase hex chars (32 bytes). Can be the same value as
-    // API_KEY_ENCRYPTION_KEY or a separate key — separate is preferred.
     ENCRYPTION_KEY: z.string()
         .length(64, 'ENCRYPTION_KEY must be 64 hex chars (32 bytes)')
         .regex(/^[0-9a-f]{64}$/, 'ENCRYPTION_KEY must be lowercase hex only'),
@@ -44,7 +41,6 @@ const schema = z.object({
     SMTP_PASSWORD: z.string(),
     EMAIL_REPLY_TO: z.string().optional(),
 
-    // S3-compatible object storage — required for document upload and presigned URLs.
     S3_BUCKET: z.string().min(1).optional(),
     S3_REGION: z.string().min(1).optional(),
     S3_ENDPOINT: z.string().url().optional(),
