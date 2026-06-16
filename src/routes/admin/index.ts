@@ -244,9 +244,6 @@ export default async function adminRoutes(app: FastifyInstance) {
             const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
             if (!doc) return reply.status(404).send({ error: 'Not found' })
 
-            // Generate a presigned URL from R2 / S3-compatible storage.
-            // Replace this with your actual storage client call.
-            // const url = await storage.presign(doc.storageKey, { expiresIn: 900 })
             const url = `${process.env['STORAGE_BASE_URL'] ?? ''}/${doc.storageKey}`
 
             audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'document', targetId: docId })
@@ -258,8 +255,6 @@ export default async function adminRoutes(app: FastifyInstance) {
     })
 
     // ── ISSUER MESSAGING ──────────────────────────────────────────────────
-    // Creates an OnboardingMessage record (visible in the issuer's dashboard
-    // notification bell) and dispatches an email to the issuer's address.
 
     app.post('/issuers/:id/message', async (req, reply) => {
         try {
