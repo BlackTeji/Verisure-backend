@@ -6,6 +6,40 @@ import { requireAdmin } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { emailQueue } from '../../lib/queue.js'
 import { env } from '../../config/env.js'
+import { createHash, createHmac } from 'node:crypto'
+
+function presignGetUrl(storageKey: string): string {
+    const bucket = env.S3_BUCKET ?? ''
+    const region = env.S3_REGION ?? 'auto'
+    const endpoint = env.S3_ENDPOINT ?? ''
+    const accessKeyId = env.S3_ACCESS_KEY_ID ?? ''
+    const secretAccessKey = env.S3_SECRET_ACCESS_KEY ?? ''
+
+    const datetime = new Date().toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 15) + 'Z'
+    const date = datetime.slice(0, 8)
+    const credentialScope = `${date}/${region}/s3/aws4_request`
+
+    const params = new URLSearchParams({
+        'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+        'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
+        'X-Amz-Date': datetime,
+        'X-Amz-Expires': '900',
+        'X-Amz-SignedHeaders': 'host',
+    })
+
+    const host = new URL(endpoint).host
+    const canonicalUri = `/${bucket}/${storageKey}`
+    const canonicalHeaders = `host:${host}\n`
+    const canonicalRequest = ['GET', canonicalUri, params.toString(), canonicalHeaders, 'host', 'UNSIGNED-PAYLOAD'].join('\n')
+    const stringToSign = ['AWS4-HMAC-SHA256', datetime, credentialScope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
+
+    const hmac = (k: Buffer | string, d: string) => createHmac('sha256', k).update(d).digest()
+    const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, date), region), 's3'), 'aws4_request')
+    const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex')
+    params.set('X-Amz-Signature', signature)
+
+    return `${endpoint}/${bucket}/${storageKey}?${params.toString()}`
+}
 
 export default async function adminRoutes(app: FastifyInstance) {
 
@@ -188,24 +222,21 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── ISSUER DOCUMENTS ──────────────────────────────────────────────────
 
-    app.get('/issuers/:id/documents', async (req, reply) => {
-        try {
-            const { id } = req.params as { id: string }
-            const issuer = await db.issuerProfile.findUnique({ where: { id }, select: { id: true } })
-            if (!issuer) return reply.status(404).send({ error: 'Not found' })
+    app.get('/issuers/:id/documents/:docId/url', async (req, reply) => {
+    try {
+        const { id, docId } = req.params as { id: string; docId: string }
+        const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
+        if (!doc) return reply.status(404).send({ error: 'Not found' })
 
-            const documents = await db.issuerDocument.findMany({
-                where: { issuerId: id },
-                orderBy: { uploadedAt: 'asc' },
-            })
+        const url = presignGetUrl(doc.storageKey)
 
-            audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'issuer', targetId: id })
-            return reply.send({ documents })
-        } catch (err) {
-            app.log.error({ err }, 'Admin get documents error')
-            return reply.status(500).send({ error: 'Server error' })
-        }
-    })
+        audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'document', targetId: docId })
+        return reply.send({ url })
+    } catch (err) {
+        app.log.error({ err }, 'Admin get document URL error')
+        return reply.status(500).send({ error: 'Server error' })
+    }
+})
 
     app.patch('/issuers/:id/documents/:docId', async (req, reply) => {
         try {
@@ -234,22 +265,6 @@ export default async function adminRoutes(app: FastifyInstance) {
             return reply.send({ message: 'Document status updated' })
         } catch (err) {
             app.log.error({ err }, 'Admin review document error')
-            return reply.status(500).send({ error: 'Server error' })
-        }
-    })
-
-    app.get('/issuers/:id/documents/:docId/url', async (req, reply) => {
-        try {
-            const { id, docId } = req.params as { id: string; docId: string }
-            const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
-            if (!doc) return reply.status(404).send({ error: 'Not found' })
-
-            const url = `${process.env['STORAGE_BASE_URL'] ?? ''}/${doc.storageKey}`
-
-            audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'document', targetId: docId })
-            return reply.send({ url })
-        } catch (err) {
-            app.log.error({ err }, 'Admin get document URL error')
             return reply.status(500).send({ error: 'Server error' })
         }
     })
