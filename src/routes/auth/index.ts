@@ -347,7 +347,7 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-    app.get('/verify-email', async (req, reply) => {
+  app.get('/verify-email', async (req, reply) => {
         try {
             const token = (req.query as Record<string, string>)['token']
             if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
@@ -371,7 +371,7 @@ export default async function authRoutes(app: FastifyInstance) {
                 db.user.update({ where: { id: record.userId }, data: { emailVerified: true, emailVerifiedAt: new Date() } }),
             ])
 
-            const user = await db.user.findUnique({ where: { id: record.userId }, select: { email: true, role: true } })
+            const user = await db.user.findUnique({ where: { id: record.userId }, select: { id: true, email: true, role: true, isSuspended: true } })
 
             let linkedCredentials = 0
             if (user?.role === 'HOLDER') {
@@ -382,7 +382,31 @@ export default async function authRoutes(app: FastifyInstance) {
                 linkedCredentials = linked.count
             }
 
-            return reply.status(200).send({ message: 'Email verified', role: user?.role ?? null, linkedCredentials })
+            if (!user || user.isSuspended) {
+                return reply.status(200).send({ message: 'Email verified', role: user?.role ?? null, linkedCredentials })
+            }
+
+            const userAgent = req.headers['user-agent']?.slice(0, 500) ?? 'Unknown'
+            await db.userSession.create({
+                data: { userId: user.id, ipAddress: req.ip, userAgent, isActive: true },
+            }).catch(() => { })
+
+            const [accessToken, { token: refreshToken, expiresAt }] = await Promise.all([
+                issueAccessToken({ userId: user.id, email: user.email, role: user.role }),
+                issueRefreshToken({ userId: user.id, ip: req.ip, agent: req.headers['user-agent'] }),
+            ])
+
+            setRefreshCookie(reply, refreshToken, expiresAt)
+            audit({ action: 'USER_LOGIN', req, targetType: 'user', targetId: user.id, metadata: { via: 'email_verification' } })
+
+            return reply.status(200).send({
+                message: 'Email verified',
+                role: user.role,
+                linkedCredentials,
+                accessToken,
+                refreshToken,
+                user: { id: user.id, email: user.email, role: user.role },
+            })
         } catch (err) {
             app.log.error({ err }, 'Email verification error')
             return reply.status(500).send({ error: 'Server error', message: 'Something went wrong. Please try again.' })
