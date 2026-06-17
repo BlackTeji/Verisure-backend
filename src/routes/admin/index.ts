@@ -222,21 +222,42 @@ export default async function adminRoutes(app: FastifyInstance) {
 
     // ── ISSUER DOCUMENTS ──────────────────────────────────────────────────
 
+    // ── ISSUER DOCUMENTS ──────────────────────────────────────────────────
+
+    app.get('/issuers/:id/documents', async (req, reply) => {
+        try {
+            const { id } = req.params as { id: string }
+            const issuer = await db.issuerProfile.findUnique({ where: { id }, select: { id: true } })
+            if (!issuer) return reply.status(404).send({ error: 'Not found' })
+
+            const documents = await db.issuerDocument.findMany({
+                where: { issuerId: id },
+                orderBy: { uploadedAt: 'asc' },
+            })
+
+            audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'issuer', targetId: id })
+            return reply.send({ documents })
+        } catch (err) {
+            app.log.error({ err }, 'Admin get documents error')
+            return reply.status(500).send({ error: 'Server error' })
+        }
+    })
+
     app.get('/issuers/:id/documents/:docId/url', async (req, reply) => {
-    try {
-        const { id, docId } = req.params as { id: string; docId: string }
-        const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
-        if (!doc) return reply.status(404).send({ error: 'Not found' })
+        try {
+            const { id, docId } = req.params as { id: string; docId: string }
+            const doc = await db.issuerDocument.findFirst({ where: { id: docId, issuerId: id } })
+            if (!doc) return reply.status(404).send({ error: 'Not found' })
 
-        const url = presignGetUrl(doc.storageKey)
+            const url = presignGetUrl(doc.storageKey)
 
-        audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'document', targetId: docId })
-        return reply.send({ url })
-    } catch (err) {
-        app.log.error({ err }, 'Admin get document URL error')
-        return reply.status(500).send({ error: 'Server error' })
-    }
-})
+            audit({ action: 'ADMIN_DOCUMENT_ACCESSED', req, targetType: 'document', targetId: docId })
+            return reply.send({ url })
+        } catch (err) {
+            app.log.error({ err }, 'Admin get document URL error')
+            return reply.status(500).send({ error: 'Server error' })
+        }
+    })
 
     app.patch('/issuers/:id/documents/:docId', async (req, reply) => {
         try {
