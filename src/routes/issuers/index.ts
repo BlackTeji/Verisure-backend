@@ -30,7 +30,7 @@ const bulkRowSchema = z.object({
     }),
 })
 
-const MAX_BULK_ROWS = 10_000 //
+const MAX_BULK_ROWS = 10_000 
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
@@ -453,7 +453,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         })
     })
 
-    // ── BULK IMPORT ──────────────────────────────
+    // -- BULK IMPORT (CSV multipart upload) ------------------------------
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const existingActive = await db.bulkJob.findFirst({
             where: { issuerId: req.issuerId!, type: 'issuance', status: { in: ['PENDING', 'PROCESSING'] } },

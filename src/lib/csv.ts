@@ -33,7 +33,7 @@ function splitCsvRows(text: string): string[][] {
 
     for (let i = 0; i < normalised.length; i++) {
         const ch = normalised[i]
-        if (ch === undefined) continue 
+        if (ch === undefined) continue // unreachable given the loop bound; satisfies strict indexing
 
         if (inQuotes) {
             if (ch === '"') {
