@@ -4,6 +4,7 @@ import { logger } from '../lib/logger.js'
 import { db } from '../lib/db.js'
 import { anchorQueue, emailQueue, QUEUES } from '../lib/queue.js'
 import { generateCredentialId, hashCredential } from '../lib/crypto.js'
+import { parseStrictIsoDate } from '../lib/dates.js'
 import { env } from '../config/env.js'
 import type { BulkJobData } from '../lib/queue.js'
 
@@ -46,6 +47,9 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
                 const email = String(row.holderEmail).toLowerCase().trim()
                 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
                     throw new Error(`Invalid email: ${email}`)
+                
+                const issueDateObj = parseStrictIsoDate(String(row.issueDate), 'issueDate')
+                const expiryDateObj = row.expiryDate ? parseStrictIsoDate(String(row.expiryDate), 'expiryDate') : null
 
                 const id = generateCredentialId()
                 const sha256Hash = hashCredential({
@@ -54,8 +58,8 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
                     holderEmail: email,
                     credentialType: String(row.credentialType).trim(),
                     field: row.field ? String(row.field).trim() : null,
-                    issueDate: new Date(row.issueDate).toISOString(),
-                    expiryDate: row.expiryDate ? new Date(row.expiryDate).toISOString() : null,
+                    issueDate: issueDateObj.toISOString(),
+                    expiryDate: expiryDateObj ? expiryDateObj.toISOString() : null,
                     notes: row.notes ? String(row.notes).trim() : null,
                 })
 
@@ -67,8 +71,8 @@ async function runIssuance(job: any, jobId: string, fileKey: string, issuerId: s
                         credentialType: String(row.credentialType).trim(),
                         field: row.field ? String(row.field).trim() : null,
                         notes: row.notes ? String(row.notes).trim() : null,
-                        issueDate: new Date(row.issueDate),
-                        expiryDate: row.expiryDate ? new Date(row.expiryDate) : null,
+                        issueDate: issueDateObj,
+                        expiryDate: expiryDateObj,
                         sha256Hash,
                         status: 'ACTIVE',
                     },

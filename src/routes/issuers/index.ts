@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import type { MultipartFile } from '@fastify/multipart'
 import { z } from 'zod'
 import { db } from '../../lib/db.js'
 import { redis, keys } from '../../lib/redis.js'
@@ -9,10 +10,33 @@ import { requireIssuer, requireApprovedIssuer } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
+import { parseCsv } from '../../lib/csv.js'
+import { isStrictIsoDateString } from '../../lib/dates.js'
 import { createCipheriv, createHash, createHmac, randomBytes, scrypt } from 'node:crypto'
 import { promisify } from 'node:util'
 
 const scryptAsync = promisify(scrypt)
+
+// Row-level schema applied to every parsed CSV row. Matches the credential
+// fields the bulk-worker expects (see workers/bulk-worker.ts runIssuance).
+// issueDate/expiryDate are restricted to ISO 8601 (YYYY-MM-DD) — see
+// lib/dates.ts for why locale-ambiguous formats (2/17/2024 vs 17/2/2024)
+// are rejected rather than guessed.
+const bulkRowSchema = z.object({
+    holderName: z.string().min(1).max(200),
+    holderEmail: z.string().email().toLowerCase(),
+    credentialType: z.string().min(1).max(200),
+    field: z.string().max(200).optional(),
+    notes: z.string().max(1000).optional(),
+    issueDate: z.string().min(1).refine(isStrictIsoDateString, {
+        message: 'issueDate must be ISO 8601 format (YYYY-MM-DD), e.g. 2024-02-17. Ambiguous formats like 2/17/2024 are rejected.',
+    }),
+    expiryDate: z.string().optional().refine(v => v === undefined || isStrictIsoDateString(v), {
+        message: 'expiryDate must be ISO 8601 format (YYYY-MM-DD).',
+    }),
+})
+
+const MAX_BULK_ROWS = 10_000 // TRD-VS-1.0 §6.4 — Bulk issuance rate limit
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
@@ -435,26 +459,134 @@ export default async function issuerRoutes(app: FastifyInstance) {
         })
     })
 
+    // ── BULK IMPORT (CSV multipart upload) ───────────────────────────────
+    // Accepts a multipart/form-data upload with a single "file" field
+    // containing CSV content. Parses, validates per-row, enforces the
+    // TRD-VS-1.0 §6.4 bulk limits (max 10,000 rows/job, 1 active job per
+    // issuer), then enqueues to the bulk-worker in the same JSON-row shape
+    // it has always expected. @fastify/multipart is already registered
+    // globally in app.ts with a 5MB file-size ceiling — no app.ts changes
+    // are required for this fix.
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
-        const body = z.object({
-            credentials: z.array(z.object({
-                holderName: z.string().min(1),
-                holderEmail: z.string().email().toLowerCase(),
-                credentialType: z.string().min(1),
-                field: z.string().optional(),
-                notes: z.string().optional(),
-                issueDate: z.string(),
-                expiryDate: z.string().optional(),
-            })).min(1).max(10000),
-            filename: z.string().optional(),
-        }).safeParse(req.body)
-        if (!body.success) return reply.status(400).send({ error: 'Validation error', issues: body.error.issues })
-        const job = await db.bulkJob.create({
-            data: { type: 'issuance', issuerId: req.issuerId!, filename: body.data.filename ?? `bulk_${Date.now()}.json`, totalRows: body.data.credentials.length, status: 'PENDING' },
+        const existingActive = await db.bulkJob.findFirst({
+            where: { issuerId: req.issuerId!, type: 'issuance', status: { in: ['PENDING', 'PROCESSING'] } },
+            select: { id: true, createdAt: true },
         })
-        await bulkQueue.add('bulk-issuance', { jobId: job.id, type: 'issuance', fileKey: JSON.stringify(body.data.credentials), issuerId: req.issuerId! })
-        audit({ action: 'BULK_IMPORT_STARTED', req, targetType: 'bulk_job', targetId: job.id, metadata: { rows: body.data.credentials.length } })
-        return reply.status(202).send({ jobId: job.id, status: 'PENDING', rows: body.data.credentials.length })
+        if (existingActive) {
+            return reply.status(409).send({
+                error: 'Conflict',
+                message: 'You already have an active bulk issuance job. Wait for it to finish before starting another.',
+                jobId: existingActive.id,
+            })
+        }
+
+        let data: MultipartFile | undefined
+        try {
+            data = await req.file()
+        } catch (err) {
+            app.log.warn({ err }, 'bulk-jobs: multipart read failed')
+            return reply.status(400).send({ error: 'Validation error', message: 'Could not read the uploaded file. Make sure it is sent as multipart/form-data under a "file" field.' })
+        }
+        if (!data) {
+            return reply.status(400).send({ error: 'Validation error', message: 'No file uploaded. Attach a CSV file under the "file" field.' })
+        }
+
+        const filename = data.filename ?? 'upload.csv'
+        const isCsv = data.mimetype === 'text/csv'
+            || data.mimetype === 'application/vnd.ms-excel'
+            || data.mimetype === 'application/csv'
+            || filename.toLowerCase().endsWith('.csv')
+        if (!isCsv) {
+            return reply.status(400).send({ error: 'Validation error', message: 'Only CSV files are accepted for bulk issuance.' })
+        }
+
+        let buffer: Buffer
+        try {
+            buffer = await data.toBuffer()
+        } catch (err) {
+            app.log.warn({ err }, 'bulk-jobs: file buffering failed')
+            return reply.status(413).send({ error: 'Payload too large', message: 'CSV file exceeds the upload limit.' })
+        }
+        if (data.file.truncated) {
+            return reply.status(413).send({ error: 'Payload too large', message: 'CSV file exceeds the upload limit (5MB max).' })
+        }
+
+        let rawRows: Record<string, string>[]
+        try {
+            rawRows = parseCsv(buffer.toString('utf8'))
+        } catch (err) {
+            app.log.warn({ err }, 'bulk-jobs: csv parse failed')
+            return reply.status(400).send({ error: 'Validation error', message: 'Could not parse CSV file. Check formatting and try again.' })
+        }
+
+        if (rawRows.length === 0) {
+            return reply.status(400).send({ error: 'Validation error', message: 'CSV file contains no data rows.' })
+        }
+        if (rawRows.length > MAX_BULK_ROWS) {
+            return reply.status(400).send({
+                error: 'Validation error',
+                message: `CSV contains ${rawRows.length.toLocaleString()} rows. Maximum is ${MAX_BULK_ROWS.toLocaleString()} rows per job. Split this file into multiple uploads.`,
+            })
+        }
+
+        const credentials: z.infer<typeof bulkRowSchema>[] = []
+        const rowErrors: { row: number; error: string }[] = []
+
+        rawRows.forEach((raw, i) => {
+            const normalised = {
+                holderName: raw.holderName?.trim(),
+                holderEmail: raw.holderEmail?.trim(),
+                credentialType: raw.credentialType?.trim(),
+                field: raw.field?.trim() || undefined,
+                notes: raw.notes?.trim() || undefined,
+                issueDate: raw.issueDate?.trim(),
+                expiryDate: raw.expiryDate?.trim() || undefined,
+            }
+            const parsed = bulkRowSchema.safeParse(normalised)
+            if (!parsed.success) {
+                rowErrors.push({ row: i + 2, error: parsed.error.issues[0]?.message ?? 'Invalid row' }) // +2: header row + 1-index
+                return
+            }
+            credentials.push(parsed.data)
+        })
+
+        if (credentials.length === 0) {
+            return reply.status(400).send({
+                error: 'Validation error',
+                message: 'No valid rows found in CSV. Check column headers match: holderName, holderEmail, credentialType, field, issueDate, expiryDate, notes.',
+                issues: rowErrors.slice(0, 20),
+            })
+        }
+
+        const job = await db.bulkJob.create({
+            data: {
+                type: 'issuance',
+                issuerId: req.issuerId!,
+                filename,
+                totalRows: credentials.length,
+                status: 'PENDING',
+            },
+        })
+
+        await bulkQueue.add('bulk-issuance', {
+            jobId: job.id,
+            type: 'issuance',
+            fileKey: JSON.stringify(credentials),
+            issuerId: req.issuerId!,
+        })
+
+        audit({
+            action: 'BULK_IMPORT_STARTED', req, targetType: 'bulk_job', targetId: job.id,
+            metadata: { rows: credentials.length, skippedRows: rowErrors.length, filename },
+        })
+
+        return reply.status(202).send({
+            jobId: job.id,
+            status: 'PENDING',
+            rows: credentials.length,
+            skippedRows: rowErrors.length,
+            ...(rowErrors.length > 0 ? { rowErrorsPreview: rowErrors.slice(0, 20) } : {}),
+        })
     })
 
     app.get('/me/bulk-jobs', async (req, reply) => {
