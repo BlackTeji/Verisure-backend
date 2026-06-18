@@ -1,5 +1,4 @@
 import type { FastifyInstance } from 'fastify'
-import type { MultipartFile } from '@fastify/multipart'
 import { z } from 'zod'
 import { db } from '../../lib/db.js'
 import { redis, keys } from '../../lib/redis.js'
@@ -17,11 +16,6 @@ import { promisify } from 'node:util'
 
 const scryptAsync = promisify(scrypt)
 
-// Row-level schema applied to every parsed CSV row. Matches the credential
-// fields the bulk-worker expects (see workers/bulk-worker.ts runIssuance).
-// issueDate/expiryDate are restricted to ISO 8601 (YYYY-MM-DD) — see
-// lib/dates.ts for why locale-ambiguous formats (2/17/2024 vs 17/2/2024)
-// are rejected rather than guessed.
 const bulkRowSchema = z.object({
     holderName: z.string().min(1).max(200),
     holderEmail: z.string().email().toLowerCase(),
@@ -36,7 +30,7 @@ const bulkRowSchema = z.object({
     }),
 })
 
-const MAX_BULK_ROWS = 10_000 // TRD-VS-1.0 §6.4 — Bulk issuance rate limit
+const MAX_BULK_ROWS = 10_000 //
 
 export default async function issuerRoutes(app: FastifyInstance) {
 
@@ -460,13 +454,6 @@ export default async function issuerRoutes(app: FastifyInstance) {
     })
 
     // ── BULK IMPORT (CSV multipart upload) ───────────────────────────────
-    // Accepts a multipart/form-data upload with a single "file" field
-    // containing CSV content. Parses, validates per-row, enforces the
-    // TRD-VS-1.0 §6.4 bulk limits (max 10,000 rows/job, 1 active job per
-    // issuer), then enqueues to the bulk-worker in the same JSON-row shape
-    // it has always expected. @fastify/multipart is already registered
-    // globally in app.ts with a 5MB file-size ceiling — no app.ts changes
-    // are required for this fix.
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const existingActive = await db.bulkJob.findFirst({
             where: { issuerId: req.issuerId!, type: 'issuance', status: { in: ['PENDING', 'PROCESSING'] } },
@@ -480,7 +467,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
             })
         }
 
-        let data: MultipartFile | undefined
+        let data: Awaited<ReturnType<typeof req.file>>
         try {
             data = await req.file()
         } catch (err) {
@@ -534,13 +521,13 @@ export default async function issuerRoutes(app: FastifyInstance) {
 
         rawRows.forEach((raw, i) => {
             const normalised = {
-                holderName: raw.holderName?.trim(),
-                holderEmail: raw.holderEmail?.trim(),
-                credentialType: raw.credentialType?.trim(),
-                field: raw.field?.trim() || undefined,
-                notes: raw.notes?.trim() || undefined,
-                issueDate: raw.issueDate?.trim(),
-                expiryDate: raw.expiryDate?.trim() || undefined,
+                holderName: raw['holderName']?.trim(),
+                holderEmail: raw['holderEmail']?.trim(),
+                credentialType: raw['credentialType']?.trim(),
+                field: raw['field']?.trim() || undefined,
+                notes: raw['notes']?.trim() || undefined,
+                issueDate: raw['issueDate']?.trim(),
+                expiryDate: raw['expiryDate']?.trim() || undefined,
             }
             const parsed = bulkRowSchema.safeParse(normalised)
             if (!parsed.success) {

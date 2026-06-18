@@ -2,12 +2,16 @@ export function parseCsv(text: string): Record<string, string>[] {
     const rows = splitCsvRows(text)
     if (rows.length === 0) return []
 
-    const header = rows[0].map(h => h.trim())
+    const headerRow = rows[0]
+    if (!headerRow) return []
+    const header = headerRow.map(h => h.trim())
+
     const out: Record<string, string>[] = []
 
     for (let i = 1; i < rows.length; i++) {
         const row = rows[i]
-        if (row.length === 1 && row[0].trim() === '') continue
+        if (!row) continue
+\        if (row.length === 1 && (row[0] ?? '').trim() === '') continue
 
         const record: Record<string, string> = {}
         header.forEach((h, idx) => {
@@ -29,6 +33,7 @@ function splitCsvRows(text: string): string[][] {
 
     for (let i = 0; i < normalised.length; i++) {
         const ch = normalised[i]
+        if (ch === undefined) continue 
 
         if (inQuotes) {
             if (ch === '"') {
