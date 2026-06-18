@@ -11,7 +11,7 @@ export function parseCsv(text: string): Record<string, string>[] {
     for (let i = 1; i < rows.length; i++) {
         const row = rows[i]
         if (!row) continue
-\        if (row.length === 1 && (row[0] ?? '').trim() === '') continue
+        if (row.length === 1 && (row[0] ?? '').trim() === '') continue
 
         const record: Record<string, string> = {}
         header.forEach((h, idx) => {
