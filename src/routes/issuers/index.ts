@@ -453,7 +453,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         })
     })
 
-    // ── BULK IMPORT ───────────────────────────────
+    // ── BULK IMPORT ──────────────────────────────
     app.post('/me/bulk-jobs', { preHandler: requireApprovedIssuer }, async (req, reply) => {
         const existingActive = await db.bulkJob.findFirst({
             where: { issuerId: req.issuerId!, type: 'issuance', status: { in: ['PENDING', 'PROCESSING'] } },
