@@ -49,7 +49,6 @@ const worker = new Worker<AnchorJobData>(
             return
         }
 
-        // ── Guard: revoked credentials are not anchored ───────
         if (cred.status === 'REVOKED') {
             logger.info({ credentialId }, 'anchor-worker: credential revoked before anchoring — discarding')
             return
