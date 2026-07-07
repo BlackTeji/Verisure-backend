@@ -8,6 +8,11 @@ const MATIC_PER_ANCHOR = 0.002
 
 const DELAY_BETWEEN_JOBS_MS = 2000
 
+interface BackfillRow {
+    id: string
+    sha256Hash: string
+}
+
 async function main() {
     const args = process.argv.slice(2)
     const dryRun = args.includes('--dry-run')
@@ -16,7 +21,6 @@ async function main() {
 
     logger.info({ dryRun, batchSize }, 'backfill-anchors: starting')
 
-    // -- Wallet balance check ------------------------------------------
     logger.info('backfill-anchors: checking wallet balance...')
     let walletBalance = 0
     let walletAddress = 'unknown'
@@ -29,8 +33,6 @@ async function main() {
     } catch (err) {
         logger.error({ err }, 'backfill-anchors: could not check wallet balance - proceeding with caution')
     }
-
-    // -- Find credentials needing anchoring ---------------------------
 
     const [failedCount, neverAnchoredCount] = await Promise.all([
         db.credential.count({
@@ -101,7 +103,7 @@ async function main() {
     logger.info({ batchSize, delayBetweenJobsMs: DELAY_BETWEEN_JOBS_MS }, 'backfill-anchors: queueing jobs...')
 
     while (true) {
-        const batch = await db.credential.findMany({
+        const batch: BackfillRow[] = await db.credential.findMany({
             where: {
                 txHash: null,
                 blockchainNetwork: null,
@@ -115,11 +117,10 @@ async function main() {
 
         if (batch.length === 0) break
 
-        const jobs = batch.map((cred, idx) => ({
+        const jobs = batch.map((cred: BackfillRow, idx: number) => ({
             name: 'anchor-backfill',
             data: { credentialId: cred.id, sha256Hash: cred.sha256Hash },
             opts: {
- 
                 delay: (queued + idx) * DELAY_BETWEEN_JOBS_MS,
                 attempts: 3,
                 backoff: { type: 'exponential' as const, delay: 5000 },
@@ -143,7 +144,6 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 100))
     }
 
-    const firstJobDelay = 0
     const lastJobDelay = (queued - 1) * DELAY_BETWEEN_JOBS_MS
     const completionEstimate = new Date(Date.now() + lastJobDelay + 30_000).toISOString()
 
