@@ -9,6 +9,7 @@ import { requireIssuer, requireApprovedIssuer } from '../../hooks/authorize.js'
 import { audit } from '../../hooks/audit.js'
 import { revokeAllUserTokens } from '../../lib/jwt.js'
 import { env } from '../../config/env.js'
+import { INSTITUTION_TYPES } from '../../lib/institution-types.js'
 import { parseCsv } from '../../lib/csv.js'
 import { isStrictIsoDateString } from '../../lib/dates.js'
 import { createCipheriv, createHash, createHmac, randomBytes, scrypt } from 'node:crypto'
@@ -94,7 +95,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         protectedApp.patch('/me', async (req, reply) => {
             const body = z.object({
                 institutionName: z.string().max(200).optional(),
-                institutionType: z.string().optional(),
+                institutionType: z.enum(INSTITUTION_TYPES).optional(),
                 registrationNumber: z.string().optional(),
                 phone: z.string().optional(),
                 websiteUrl: z.string().url().optional(),
@@ -114,7 +115,7 @@ export default async function issuerRoutes(app: FastifyInstance) {
         protectedApp.post('/onboarding/step/1', async (req, reply) => {
             const body = z.object({
                 institutionName: z.string().min(1).max(200),
-                institutionType: z.string().min(1),
+                institutionType: z.enum(INSTITUTION_TYPES),
                 registrationNumber: z.string().optional(),
                 contactFirstName: z.string().min(1),
                 contactLastName: z.string().min(1),

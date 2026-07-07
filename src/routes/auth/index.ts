@@ -9,6 +9,7 @@ import { emailQueue } from '../../lib/queue.js'
 import { authenticate } from '../../hooks/authenticate.js'
 import { audit } from '../../hooks/audit.js'
 import { env } from '../../config/env.js'
+import { INSTITUTION_TYPES } from '../../lib/institution-types.js'
 
 const scryptAsync = promisify(scrypt)
 const COOKIE = 'vrs_refresh'
@@ -56,7 +57,7 @@ const signupSchema = z.object({
     lastName: z.string().max(100).optional(),
     phone: z.string().optional(),
     institutionName: z.string().optional(),
-    institutionType: z.string().optional(),
+    institutionType: z.enum(INSTITUTION_TYPES).optional(),
     registrationNumber: z.string().optional(),
     contactFirstName: z.string().optional(),
     contactLastName: z.string().optional(),
@@ -82,8 +83,8 @@ export default async function authRoutes(app: FastifyInstance) {
             const existing = await db.user.findUnique({ where: { email: d.email } })
             if (existing) return reply.status(409).send({ error: 'Conflict', message: 'Account already exists' })
 
-            if (d.role === 'ISSUER' && (!d.institutionName || !d.officialEmail || !d.contactFirstName || !d.contactLastName)) {
-                return reply.status(400).send({ error: 'Validation error', message: 'Institution details required' })
+            if (d.role === 'ISSUER' && (!d.institutionName || !d.institutionType || !d.officialEmail || !d.contactFirstName || !d.contactLastName)) {
+                return reply.status(400).send({ error: 'Validation error', message: 'Institution details required: name, type, official email, and contact name.' })
             }
 
             let claimedCredential: { id: string } | null = null
@@ -117,7 +118,7 @@ export default async function authRoutes(app: FastifyInstance) {
                     select: { id: true, email: true, role: true },
                 })
                 if (d.role === 'HOLDER') await tx.holderProfile.create({ data: { userId: u.id } })
-                if (d.role === 'ISSUER') await tx.issuerProfile.create({ data: { userId: u.id, institutionName: d.institutionName!, institutionType: d.institutionType ?? '', registrationNumber: d.registrationNumber ?? null, officialEmail: d.officialEmail!, phone: d.phone ?? null, contactFirstName: d.contactFirstName!, contactLastName: d.contactLastName!, contactTitle: d.contactTitle ?? null, annualVolume: d.annualVolume ?? null, status: 'PENDING' } })
+                if (d.role === 'ISSUER') await tx.issuerProfile.create({ data: { userId: u.id, institutionName: d.institutionName!, institutionType: d.institutionType!, registrationNumber: d.registrationNumber ?? null, officialEmail: d.officialEmail!, phone: d.phone ?? null, contactFirstName: d.contactFirstName!, contactLastName: d.contactLastName!, contactTitle: d.contactTitle ?? null, annualVolume: d.annualVolume ?? null, status: 'PENDING' } })
                 if (d.role === 'VERIFIER') await tx.verifierProfile.create({ data: { userId: u.id, organisationName: d.organisationName ?? '', organisationType: d.organisationType ?? '', teamSize: d.teamSize ?? null, monthlyVolume: d.monthlyVolume ?? null } })
 
                 let linkedCount = 0
@@ -347,7 +348,7 @@ export default async function authRoutes(app: FastifyInstance) {
         }
     })
 
-  app.get('/verify-email', async (req, reply) => {
+    app.get('/verify-email', async (req, reply) => {
         try {
             const token = (req.query as Record<string, string>)['token']
             if (!token) return reply.status(400).send({ error: 'Bad request', message: 'Token required' })
