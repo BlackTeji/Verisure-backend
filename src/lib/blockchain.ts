@@ -9,15 +9,34 @@ const ABI = [
     'event Anchored(bytes32 indexed hash, uint256 indexed timestamp, address indexed sender)',
 ]
 
-// ── SINGLETON ─────────────────────────────────────────────────
+const CHAIN_IDS: Record<string, number> = {
+    'polygon-mainnet': 137,
+    'polygon-amoy': 80002,
+}
+
 let _provider: ethers.JsonRpcProvider | null = null
 let _wallet: ethers.Wallet | null = null
 let _contract: ethers.Contract | null = null
+let _verifiedChainId: number | null = null
 
 function resetInstances() {
     _provider = null
     _wallet = null
     _contract = null
+    _verifiedChainId = null
+}
+
+function declaredNetwork(): string {
+    if (!env.POLYGON_NETWORK) {
+        throw new Error(
+            'POLYGON_NETWORK is not set. Must be explicitly "polygon-mainnet" or "polygon-amoy". ' +
+            'Network is never inferred from RPC URL.'
+        )
+    }
+    if (!CHAIN_IDS[env.POLYGON_NETWORK]) {
+        throw new Error(`Unknown POLYGON_NETWORK value: ${env.POLYGON_NETWORK}`)
+    }
+    return env.POLYGON_NETWORK
 }
 
 function getInstances() {
@@ -26,6 +45,8 @@ function getInstances() {
         if (!env.POLYGON_PRIVATE_KEY) throw new Error('POLYGON_PRIVATE_KEY is not set')
         if (!env.POLYGON_ANCHOR_CONTRACT) throw new Error('POLYGON_ANCHOR_CONTRACT is not set')
 
+        declaredNetwork()
+
         _provider = new ethers.JsonRpcProvider(env.POLYGON_RPC_URL)
         _wallet = new ethers.Wallet(env.POLYGON_PRIVATE_KEY, _provider)
         _contract = new ethers.Contract(env.POLYGON_ANCHOR_CONTRACT, ABI, _wallet)
@@ -33,36 +54,58 @@ function getInstances() {
     return { provider: _provider!, wallet: _wallet!, contract: _contract! }
 }
 
-// ── NETWORK NAME ──────────────────────────────────────────────
+async function assertChainIdMatches(provider: ethers.JsonRpcProvider): Promise<void> {
+    const declared = declaredNetwork()
+    const expectedChainId = CHAIN_IDS[declared]!
+
+    if (_verifiedChainId === expectedChainId) return
+
+    const network = await provider.getNetwork()
+    const actualChainId = Number(network.chainId)
+
+    if (actualChainId !== expectedChainId) {
+        resetInstances()
+        throw new Error(
+            `Chain ID mismatch: POLYGON_NETWORK is set to "${declared}" (expects chain ID ${expectedChainId}), ` +
+            `but the RPC endpoint at POLYGON_RPC_URL reports chain ID ${actualChainId}. ` +
+            `Refusing to anchor. Check POLYGON_RPC_URL and POLYGON_NETWORK for a mismatch.`
+        )
+    }
+
+    _verifiedChainId = actualChainId
+}
+
 function networkName(): string {
-    return env.POLYGON_NETWORK ?? (env.POLYGON_RPC_URL?.includes('amoy') ? 'polygon-amoy' : 'polygon-mainnet')
+    return declaredNetwork()
 }
 
 const GAS_BUFFER_PCT = 130n
 const GAS_CAP = 500_000n
+const DEFAULT_MIN_BALANCE_MATIC = 0.1
+const STATIC_PRIORITY_FEE_GWEI = '30'
 
-// ── EIP-1559 FEE ESTIMATION ───────────────────────────────────
 async function estimateFees(provider: ethers.JsonRpcProvider): Promise<{
     maxFeePerGas: bigint
     maxPriorityFeePerGas: bigint
 }> {
-    const feeData = await provider.getFeeData()
-    const base = feeData.gasPrice ?? feeData.maxFeePerGas ?? ethers.parseUnits('50', 'gwei')
-    const tip = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('2', 'gwei')
-    const max = base * 2n + tip
-    return { maxFeePerGas: max, maxPriorityFeePerGas: tip }
+    const gasPriceHex = await provider.send('eth_gasPrice', [])
+    const gasPrice = BigInt(gasPriceHex)
+    const maxPriorityFeePerGas = ethers.parseUnits(STATIC_PRIORITY_FEE_GWEI, 'gwei')
+    const maxFeePerGas = gasPrice * 2n + maxPriorityFeePerGas
+    return { maxFeePerGas, maxPriorityFeePerGas }
 }
 
-// ── WALLET BALANCE ────────────────────────────────────────────
 export async function checkAnchorWalletBalance() {
     try {
         const { provider, wallet } = getInstances()
+        await assertChainIdMatches(provider)
         const balance = await provider.getBalance(wallet.address)
         const balanceMatic = ethers.formatEther(balance)
         return {
             address: wallet.address,
             balanceMatic,
-            isSufficient: parseFloat(balanceMatic) >= (env.POLYGON_MIN_BALANCE ?? 0.01),
+            isSufficient: parseFloat(balanceMatic) >= (env.POLYGON_MIN_BALANCE ?? DEFAULT_MIN_BALANCE_MATIC),
+            network: networkName(),
         }
     } catch (err) {
         resetInstances()
@@ -70,7 +113,6 @@ export async function checkAnchorWalletBalance() {
     }
 }
 
-// ── ANCHOR ────────────────────────────────────────────────────
 export interface AnchorResult {
     txHash: string
     blockNumber: number
@@ -86,11 +128,11 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
     const hashBytes = ('0x' + sha256Hash) as `0x${string}`
 
     const { contract, provider } = getInstances()
+    await assertChainIdMatches(provider)
     const fn = contract.getFunction('anchor')
 
     logger.info({ credentialId, sha256Hash, network: networkName() }, 'blockchain: estimating gas')
 
-    // ── EIP-1559 fees ─────────────────────────────────────────
     const { maxFeePerGas, maxPriorityFeePerGas } = await estimateFees(provider)
 
     let gasLimit: bigint
@@ -100,7 +142,7 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
     } catch (err: any) {
         const msg: string = err?.message ?? ''
         if (msg.includes('Already anchored')) {
-            logger.warn({ credentialId }, 'blockchain: hash already on-chain — recovering')
+            logger.warn({ credentialId }, 'blockchain: hash already on-chain -- recovering')
             return recoverAlreadyAnchored(credentialId, sha256Hash)
         }
         resetInstances()
@@ -152,7 +194,6 @@ export async function anchorHash(credentialId: string, sha256Hash: string): Prom
     return result
 }
 
-// ── RECOVER ALREADY-ANCHORED ──────────────────────────────────
 async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string): Promise<AnchorResult> {
     const { contract, provider } = getInstances()
     const hashBytes = '0x' + sha256Hash
@@ -171,7 +212,11 @@ async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string):
     })
 
     if (!logs.length) {
-        throw new Error(`Hash reported as already anchored but no Anchored event found for ${sha256Hash}`)
+        throw new Error(
+            `Hash reported as already anchored but no Anchored event found for ${sha256Hash} ` +
+            `within the last ${currentBlock - fromBlock} blocks. If this credential was anchored ` +
+            `longer ago than that window, widen the lookback range or query from the contract's deploy block.`
+        )
     }
 
     const event = logs[0]
@@ -202,10 +247,10 @@ async function recoverAlreadyAnchored(credentialId: string, sha256Hash: string):
     return result
 }
 
-// ── VERIFY ON-CHAIN ───────────────────────────────────────────
 export async function verifyHashOnChain(txHash: string, expectedHash: string): Promise<boolean> {
     try {
         const { provider } = getInstances()
+        await assertChainIdMatches(provider)
         const receipt = await provider.getTransactionReceipt(txHash)
         if (!receipt) return false
 
@@ -218,7 +263,7 @@ export async function verifyHashOnChain(txHash: string, expectedHash: string): P
                     const expected = ('0x' + expectedHash).toLowerCase()
                     return onChainHash === expected
                 }
-            } catch { /* non-matching log — skip */ }
+            } catch { }
         }
         return false
     } catch (err) {
@@ -227,12 +272,17 @@ export async function verifyHashOnChain(txHash: string, expectedHash: string): P
     }
 }
 
-// ── CONTRACT PING ─────────────────────────────────────────────
-export async function pingContract(): Promise<{ ok: boolean; network: string; contract: string }> {
+export async function pingContract(): Promise<{ ok: boolean; network: string; contract: string; chainId?: number }> {
     try {
         const { provider } = getInstances()
+        await assertChainIdMatches(provider)
         await provider.getBlockNumber()
-        return { ok: true, network: networkName(), contract: env.POLYGON_ANCHOR_CONTRACT ?? '(not set)' }
+        return {
+            ok: true,
+            network: networkName(),
+            contract: env.POLYGON_ANCHOR_CONTRACT ?? '(not set)',
+            chainId: _verifiedChainId ?? undefined,
+        }
     } catch {
         resetInstances()
         return { ok: false, network: networkName(), contract: env.POLYGON_ANCHOR_CONTRACT ?? '(not set)' }
