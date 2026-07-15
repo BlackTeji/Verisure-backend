@@ -7,6 +7,8 @@ import { audit } from '../../hooks/audit.js'
 import { emailQueue } from '../../lib/queue.js'
 import { env } from '../../config/env.js'
 import { createHash, createHmac } from 'node:crypto'
+import { pingContract, checkAnchorWalletBalance } from '../../lib/blockchain.js'
+import { getApiMetrics, pingDatabase, pingRedis, pingResend, pingR2 } from '../../lib/metrics.js'
 
 function presignGetUrl(storageKey: string): string {
     const bucket = env.S3_BUCKET ?? ''
@@ -57,31 +59,54 @@ export default async function adminRoutes(app: FastifyInstance) {
                 totalCredentials,
                 verifications24h,
                 activeAlerts,
+                anchoredToday,
             ] = await db.$transaction([
                 db.issuerProfile.count({ where: { status: 'APPROVED' } }),
                 db.credential.count(),
                 db.verificationLog.count({ where: { verifiedAt: { gte: since24h } } }),
                 db.fraudAlert.count({ where: { status: 'ACTIVE' } }),
+                db.credential.count({ where: { anchoredAt: { gte: since24h } } }),
             ])
 
+            const [contractPing, walletBalance, apiMetrics, dbUp, redisUp, resendUp, r2Up] = await Promise.allSettled([
+                pingContract(),
+                checkAnchorWalletBalance(),
+                getApiMetrics(),
+                pingDatabase(db),
+                pingRedis(),
+                pingResend(env.RESEND_API_KEY),
+                pingR2(env.S3_ENDPOINT),
+            ])
+
+            const anchorOk = contractPing.status === 'fulfilled' && contractPing.value.ok
+            const network = contractPing.status === 'fulfilled' ? contractPing.value.network : null
+            const walletBalanceMatic = walletBalance.status === 'fulfilled' ? parseFloat(walletBalance.value.balanceMatic) : null
+            const walletSufficient = walletBalance.status === 'fulfilled' ? walletBalance.value.isSufficient : null
+            const metrics = apiMetrics.status === 'fulfilled' ? apiMetrics.value : null
+            const dbOk = dbUp.status === 'fulfilled' && dbUp.value
+            const redisOk = redisUp.status === 'fulfilled' && redisUp.value
+            const resendOk = resendUp.status === 'fulfilled' && resendUp.value
+            const r2Ok = r2Up.status === 'fulfilled' && r2Up.value
+
             return reply.send({
-                uptimePct: '99.9',
-                p50Ms: '42',
-                p95Ms: '110',
-                p99Ms: '280',
-                errorRate: '0.1%',
+                successRatePct: metrics?.successRatePct ?? '—',
+                p50Ms: metrics?.p50Ms ?? null,
+                p95Ms: metrics?.p95Ms ?? null,
+                p99Ms: metrics?.p99Ms ?? null,
+                sampleSize24h: metrics?.sampleSize ?? 0,
                 activeIncidents: activeAlerts,
                 successfulCalls24h: verifications24h,
-                anchorWorkerDeployed: false,
-                walletBalanceMatic: null,
-                anchoredToday: 0,
+                anchorWorkerDeployed: anchorOk,
+                network,
+                walletBalanceMatic,
+                anchoredToday,
                 services: [
-                    { name: 'API (Railway)', status: 'up', uptime: '99.9' },
-                    { name: 'Database', status: 'up', uptime: '99.9' },
-                    { name: 'Redis / BullMQ', status: 'up', uptime: '99.8' },
-                    { name: 'R2 Storage', status: 'up', uptime: '100' },
-                    { name: 'Email (Resend)', status: 'up', uptime: '99.7' },
-                    { name: 'Anchor worker', status: 'warn', uptime: '0' },
+                    { name: 'API (Railway)', status: 'up' },
+                    { name: 'Database', status: dbOk ? 'up' : 'down' },
+                    { name: 'Redis / BullMQ', status: redisOk ? 'up' : 'down' },
+                    { name: 'R2 Storage', status: r2Ok ? 'up' : 'down' },
+                    { name: 'Email (Resend)', status: resendOk ? 'up' : 'down' },
+                    { name: 'Anchor worker', status: anchorOk ? (walletSufficient === false ? 'warn' : 'up') : 'down' },
                 ],
             })
         } catch (err) {

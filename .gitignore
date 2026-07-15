@@ -15,4 +15,4 @@ logs/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.dbbackfill.local.env

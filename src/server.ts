@@ -11,6 +11,7 @@ import { redis } from './lib/redis.js'
 import { logger } from './lib/logger.js'
 import { db } from './lib/db.js'
 import { checkBlockedIp, syncBlockedIpsFromDb } from './hooks/rate-limit.js'
+import { registerMetricsHook } from './hooks/metrics.js'
 
 import authRoutes from './routes/auth/index.js'
 import credentialRoutes from './routes/credentials/index.js'
@@ -103,6 +104,8 @@ app.addHook('onSend', async (_req, reply) => {
 })
 
 app.addHook('onRequest', checkBlockedIp)
+
+await registerMetricsHook(app)
 
 app.get('/api/health', async (_req, reply) =>
     reply.status(200).send({ status: 'ok', timestamp: new Date().toISOString(), env: env.NODE_ENV }))
